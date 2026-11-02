@@ -83,6 +83,7 @@ const ease = t => 1 - Math.pow(1 - t, 3);
 const easeIn = t => t * t * t;
 function loadNum(k) { try { return +localStorage.getItem(k) || 0; } catch (e) { return 0; } }
 function saveNum(k, v) { try { localStorage.setItem(k, String(v)); } catch (e) {} }
+function loadStr(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
 
 function rr(x, y, w, h, r) {
   r = Math.min(r, w / 2, h / 2);
@@ -120,7 +121,7 @@ function buzz(ms) { try { navigator.vibrate && navigator.vibrate(ms); } catch (e
 /* ============================================================
    GAME STATE
    ============================================================ */
-// S: 'title' | 'banner' | 'hang' | 'fall' | 'settle' | 'results'
+// S: 'title' | 'banner' | 'hang' | 'fall' | 'settle' | 'results' | 'entry' | 'board'
 // While S === 'hang' the item has a phase: enter | wait | shake | hitch | hold | exit
 let S = 'title';
 let bar = null, idx = 0, timer = 0, lastSpecial = false;
@@ -135,7 +136,24 @@ let shake = 0, flash = 0, flashColor = '#fff';
 let resLock = 0, lastFrame = performance.now();
 let toast = null;
 const dbg = { next: null };
-const shareBtn = { x: 70, y: 530, w: 280, h: 50 };
+const shareBtn = { x: 40, y: 530, w: 165, h: 50 };
+const boardBtn = { x: 215, y: 530, w: 165, h: 50 };
+const titleBoardBtn = { x: 110, y: 676, w: 200, h: 42 };
+const enterBtn = { x: 110, y: 500, w: 200, h: 56 };
+const skipBtn = { x: 150, y: 574, w: 120, h: 36 };
+const copyBtn = { x: 110, y: 618, w: 200, h: 42 };
+
+/* ---------- daily leaderboard (Supabase). "Day" = calendar day in Arizona time. ---------- */
+const LB = {
+  url: 'https://jlgmqbnokpyyhraakvce.supabase.co',
+  key: 'sb_publishable_ixrxWk3_fPpmIbjKDquZrQ_q_ZszcDq',   // public, read/submit-only by design
+  tz: 'America/Phoenix',
+  size: 10,
+};
+const CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+let board = { status: 'idle', rows: [], day: '' };   // status: idle | loading | ok | error
+let entry = null, runId = 0, lbNote = '', highlight = 0, boardFrom = 'title', boardLock = 0;
+let lastInitials = (loadStr('dropit_initials') || 'AAA').toUpperCase().replace(/[^A-Z0-9]/g, 'A').padEnd(3, 'A').slice(0, 3);
 
 /* ---------- building the next item ---------- */
 function makeSegs(off) {
@@ -204,6 +222,7 @@ function startRun() {
   score = shownScore = caught = fakes = streak = maxStreak = 0;
   accSum = 0; tierCounts = [0, 0, 0, 0]; newBest = false; dead = null;
   particles = []; texts = []; handHold = 0; hp = CFG.hpMax; hpHit = 0; level = 1;
+  runId++; entry = null; lbNote = ''; highlight = 0;
   startBanner(1, false);
 }
 
@@ -346,6 +365,103 @@ function finishRun() {
   if (score > best) { best = score; newBest = true; saveNum('dropit_best', best); }
   if (level > bestLevel) { bestLevel = level; saveNum('dropit_best_level', bestLevel); }
   tone(300, 0.2, 'triangle', 0.1); tone(240, 0.2, 'triangle', 0.1, 0.12); tone(180, 0.4, 'triangle', 0.1, 0.24);
+  checkLeaderboard();
+}
+
+/* ---------- leaderboard logic ---------- */
+async function lbCall(fn, body) {
+  const ctrl = new AbortController(), timeout = setTimeout(() => ctrl.abort(), 7000);
+  try {
+    const r = await fetch(LB.url + '/rest/v1/rpc/' + fn, {
+      method: 'POST', headers: { apikey: LB.key, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body), signal: ctrl.signal,
+    });
+    if (!r.ok) { let m = ''; try { m = (await r.json()).message || ''; } catch (e) {} throw new Error(m || 'HTTP ' + r.status); }
+    return await r.json();
+  } finally { clearTimeout(timeout); }
+}
+function todayLabel() {
+  try { return new Intl.DateTimeFormat('en-US', { timeZone: LB.tz, weekday: 'short', month: 'short', day: 'numeric' }).format(new Date()).toUpperCase(); }
+  catch (e) { return ''; }
+}
+async function loadBoard() {
+  board.status = 'loading';
+  try {
+    const rows = await lbCall('leaderboard_today', { limit_n: LB.size });
+    board = { status: 'ok', rows: Array.isArray(rows) ? rows : [], day: todayLabel() };
+  } catch (e) { board.status = 'error'; throw e; }
+}
+function qualifies(sc) { return board.status === 'ok' && sc > 0 && (board.rows.length < LB.size || sc > board.rows[LB.size - 1].score); }
+function placeFor(sc) { return board.rows.filter(r => r.score >= sc).length + 1; }
+
+function checkLeaderboard() {
+  const id = runId;
+  if (score <= 0) { lbNote = ''; return; }
+  lbNote = "CHECKING TODAY'S BOARD...";
+  loadBoard().then(() => {
+    if (id !== runId || S !== 'results') return;
+    if (qualifies(score)) {
+      entry = { ch: lastInitials.split(''), sel: 0, busy: false, place: placeFor(score) };
+      lbNote = ''; S = 'entry';
+      tone(523, 0.12, 'triangle', 0.1); tone(659, 0.12, 'triangle', 0.1, 0.1); tone(784, 0.25, 'triangle', 0.1, 0.2);
+    } else lbNote = "NOT IN TODAY'S TOP " + LB.size;
+  }).catch(() => { if (id === runId) lbNote = 'LEADERBOARD OFFLINE'; });
+}
+
+function openBoard(from) {
+  boardFrom = from; if (from !== 'run') highlight = 0;
+  S = 'board'; boardLock = 0.35;
+  loadBoard().catch(() => {});
+}
+
+async function submitEntry() {
+  if (!entry || entry.busy) return;
+  const id = runId; entry.busy = true;
+  const initials = entry.ch.join('');
+  try {
+    lastInitials = initials; try { localStorage.setItem('dropit_initials', initials); } catch (e) {}
+    const res = await lbCall('submit_score', { p_initials: initials, p_score: score, p_level: level, p_caught: caught, p_accuracy: accuracyPct() });
+    highlight = (res && res[0] && res[0].place) || 0;
+  } catch (e) {
+    if (/not_top_10/.test(e.message)) highlight = 0;           // someone beat you to it; just show the board
+    else { if (entry) entry.busy = false; toast = { msg: 'Could not save. Try again.', life: 2 }; return; }
+  }
+  try { await loadBoard(); } catch (e) {}
+  if (id !== runId) return;
+  entry = null; boardFrom = 'run'; S = 'board'; boardLock = 0.6;
+  tone(659, 0.12, 'triangle', 0.1); tone(880, 0.25, 'triangle', 0.1, 0.1);
+}
+
+function cycleChar(i, dir) {
+  const k = CHARS.indexOf(entry.ch[i]);
+  entry.ch[i] = CHARS[(k + dir + CHARS.length) % CHARS.length];
+  tone(440 + dir * 60, 0.05, 'square', 0.04);
+}
+function entryKey(e) {
+  if (!entry || entry.busy) return;
+  const k = e.key || '';
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (k.length === 1 && /[a-z0-9]/i.test(k)) { entry.ch[entry.sel] = k.toUpperCase(); entry.sel = Math.min(2, entry.sel + 1); tone(520, 0.05, 'square', 0.04); }
+  else if (k === 'Backspace') entry.sel = Math.max(0, entry.sel - 1);
+  else if (k === 'ArrowLeft') entry.sel = Math.max(0, entry.sel - 1);
+  else if (k === 'ArrowRight') entry.sel = Math.min(2, entry.sel + 1);
+  else if (k === 'ArrowUp') cycleChar(entry.sel, 1);
+  else if (k === 'ArrowDown') cycleChar(entry.sel, -1);
+  else if (k === 'Enter') submitEntry();
+  else return;
+  e.preventDefault();
+}
+const inRect = (p, b) => p && p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h;
+function entryPress(pt) {
+  if (!entry || entry.busy || !pt) return;
+  for (let i = 0; i < 3; i++) {
+    const cx = W / 2 + (i - 1) * 84;
+    if (inRect(pt, { x: cx - 32, y: 312, w: 64, h: 40 })) { entry.sel = i; cycleChar(i, 1); return; }
+    if (inRect(pt, { x: cx - 32, y: 440, w: 64, h: 40 })) { entry.sel = i; cycleChar(i, -1); return; }
+    if (inRect(pt, { x: cx - 32, y: 352, w: 64, h: 88 })) { entry.sel = i; return; }
+  }
+  if (inRect(pt, enterBtn)) submitEntry();
+  else if (inRect(pt, skipBtn)) { entry = null; S = 'results'; lbNote = ''; resLock = 0; }
 }
 
 function levelClear() {
@@ -452,6 +568,7 @@ function update(dt) {
   handHold = Math.max(0, handHold - dt);
   handGap += (target - handGap) * Math.min(1, dt * 28);
   hpHit = Math.max(0, hpHit - dt);
+  boardLock = Math.max(0, boardLock - dt);
 
   if (S === 'banner') {
     banner.t += dt;
@@ -711,7 +828,14 @@ function drawTitle() {
   lines.forEach((l, i) => text(l, W / 2, 350 + i * 26, 15, '#8d97d6', 'center', 500));
   const pulse = 0.65 + 0.35 * Math.sin(performance.now() / 350);
   text('TAP TO START', W / 2, 610, 26, '#ffe066', 'center', 800, pulse);
-  if (best) text(`BEST ${best}  -  LEVEL ${bestLevel}`, W / 2, 656, 15, '#8d97d6', 'center', 700);
+  if (best) text(`BEST ${best}  -  LEVEL ${bestLevel}`, W / 2, 652, 15, '#8d97d6', 'center', 700);
+  button(titleBoardBtn, "TODAY'S TOP 10", 14);
+}
+
+function button(b, label, size = 15) {
+  ctx.fillStyle = '#2a3270'; rr(b.x, b.y, b.w, b.h, 14); ctx.fill();
+  ctx.strokeStyle = '#7f8cff'; ctx.lineWidth = 2; rr(b.x, b.y, b.w, b.h, 14); ctx.stroke();
+  text(label, b.x + b.w / 2, b.y + b.h / 2, size, '#fff', 'center', 800);
 }
 
 function drawResults() {
@@ -735,12 +859,57 @@ function drawResults() {
     text(t.name, x, 477, 10, '#8d97d6', 'center', 700);
   });
   if (fakes) text(`Faked out ${fakes} time${fakes === 1 ? '' : 's'}`, W / 2, 504, 12, '#ff9f43', 'center', 700);
-  const b = shareBtn;
-  ctx.fillStyle = '#2a3270'; rr(b.x, b.y, b.w, b.h, 14); ctx.fill();
-  ctx.strokeStyle = '#7f8cff'; ctx.lineWidth = 2; rr(b.x, b.y, b.w, b.h, 14); ctx.stroke();
-  text('COPY RESULT TO SHARE', W / 2, b.y + b.h / 2, 15, '#fff', 'center', 800);
+  button(shareBtn, 'COPY RESULT', 14);
+  button(boardBtn, "TODAY'S TOP 10", 14);
   const pulse = resLock > 0 ? 0.25 : 0.65 + 0.35 * Math.sin(performance.now() / 350);
-  text('TAP ANYWHERE TO PLAY AGAIN', W / 2, 605, 16, '#ffe066', 'center', 800, pulse);
+  text('TAP ANYWHERE TO PLAY AGAIN', W / 2, 604, 16, '#ffe066', 'center', 800, pulse);
+  if (lbNote) text(lbNote, W / 2, 628, 11, '#8d97d6', 'center', 700);
+}
+
+function drawEntry() {
+  overlayDim(0.97);
+  const blink = 0.7 + 0.3 * Math.sin(performance.now() / 160);
+  text('TOP 10 TODAY!', W / 2, 108, 36, '#ffe066', 'center', 800, blink);
+  text('#' + entry.place + ' SO FAR', W / 2, 150, 18, '#5ef2c2', 'center', 800);
+  text(String(score), W / 2, 228, 72, '#fff', 'center', 800);
+  text('ENTER YOUR INITIALS', W / 2, 296, 14, '#8d97d6', 'center', 700);
+  for (let i = 0; i < 3; i++) {
+    const cx = W / 2 + (i - 1) * 84, on = i === entry.sel;
+    ctx.fillStyle = '#141a3d'; rr(cx - 32, 352, 64, 88, 12); ctx.fill();
+    ctx.strokeStyle = on ? '#ffe066' : 'rgba(159,176,255,.3)'; ctx.lineWidth = 3; rr(cx - 32, 352, 64, 88, 12); ctx.stroke();
+    text(entry.ch[i], cx, 398, 58, on ? '#ffe066' : '#fff', 'center', 800);
+    ctx.fillStyle = '#9fb0ff';
+    ctx.beginPath(); ctx.moveTo(cx - 13, 340); ctx.lineTo(cx + 13, 340); ctx.lineTo(cx, 322); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(cx - 13, 452); ctx.lineTo(cx + 13, 452); ctx.lineTo(cx, 470); ctx.closePath(); ctx.fill();
+  }
+  button(enterBtn, entry.busy ? 'SAVING...' : 'ENTER', 22);
+  text('SKIP', W / 2, 592, 14, '#8d97d6', 'center', 700);
+  text('tap the arrows, or just type', W / 2, 660, 12, '#6671b5', 'center', 500);
+}
+
+function drawBoard() {
+  overlayDim(0.97);
+  text("TODAY'S TOP 10", W / 2, 80, 32, '#ffe066', 'center', 800);
+  text(board.day || todayLabel(), W / 2, 114, 14, '#aab4ee', 'center', 700);
+  text('RESETS AT MIDNIGHT, ARIZONA TIME', W / 2, 134, 10, '#6671b5', 'center', 700);
+  if (board.status !== 'ok') {
+    text(board.status === 'loading' ? 'LOADING...' : 'LEADERBOARD OFFLINE', W / 2, 350, 22, '#8d97d6', 'center', 800);
+    if (board.status === 'error') text('Scores need an internet connection.', W / 2, 384, 13, '#6671b5', 'center', 500);
+  } else {
+    for (let i = 0; i < LB.size; i++) {
+      const row = board.rows[i], y = 176 + i * 38, mine = row && highlight && row.place === highlight;
+      if (mine) { ctx.fillStyle = `rgba(255,224,102,${0.14 + 0.1 * Math.sin(performance.now() / 160)})`; rr(34, y - 17, W - 68, 34, 8); ctx.fill(); }
+      const col = mine ? '#ffe066' : row ? '#fff' : '#3a4380';
+      text(String(i + 1), 64, y, 18, i < 3 && row ? ['#ffe066', '#c3c9dd', '#e8a468'][i] : '#8d97d6', 'center', 800);
+      text(row ? row.initials : '---', 104, y, 26, col, 'left', 800);
+      if (row) text('L' + row.level, 250, y, 13, '#8d97d6', 'right', 700);
+      text(row ? String(row.score) : '0', W - 54, y, 22, col, 'right', 800);
+    }
+    if (!board.rows.length) text('No scores yet today. Be the first!', W / 2, 580, 14, '#8d97d6', 'center', 600);
+  }
+  if (boardFrom === 'run') button(copyBtn, 'COPY MY RESULT', 14);
+  const pulse = boardLock > 0 ? 0.25 : 0.65 + 0.35 * Math.sin(performance.now() / 350);
+  text(boardFrom === 'run' ? 'TAP ANYWHERE TO PLAY AGAIN' : 'TAP ANYWHERE TO GO BACK', W / 2, 692, 15, '#ffe066', 'center', 800, pulse);
 }
 
 function draw() {
@@ -751,6 +920,8 @@ function draw() {
   ctx.restore();
   if (flash > 0) { ctx.globalAlpha = flash; ctx.fillStyle = flashColor; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
   if (S === 'title') drawTitle();
+  else if (S === 'entry') drawEntry();
+  else if (S === 'board') drawBoard();
   else {
     drawHUD();
     if (S === 'banner') drawBanner();
@@ -774,14 +945,23 @@ function toLogical(e) {
   const r = cv.getBoundingClientRect();
   return { x: (e.clientX - r.left) / scale, y: (e.clientY - r.top) / scale };
 }
-function inShare(p) { const b = shareBtn; return p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h; }
 
 function press(e, pt) {
   audio();
-  if (S === 'title') { startRun(); return; }
+  if (S === 'title') { if (inRect(pt, titleBoardBtn)) openBoard('title'); else startRun(); return; }
   if (S === 'banner') { if (banner.t > 0.5) beginLevel(); return; }
+  if (S === 'entry') { entryPress(pt); return; }
+  if (S === 'board') {
+    if (boardFrom === 'run' && inRect(pt, copyBtn)) { doShare(); return; }
+    if (boardLock > 0) return;
+    if (boardFrom === 'run') startRun();
+    else if (boardFrom === 'results') { S = 'results'; resLock = 0; }
+    else S = 'title';
+    return;
+  }
   if (S === 'results') {
-    if (pt && inShare(pt)) { doShare(); return; }
+    if (inRect(pt, shareBtn)) { doShare(); return; }
+    if (inRect(pt, boardBtn)) { openBoard('results'); return; }
     if (resLock <= 0) startRun();
     return;
   }
@@ -791,6 +971,7 @@ function press(e, pt) {
 cv.addEventListener('pointerdown', e => { e.preventDefault(); press(e, toLogical(e)); });
 addEventListener('keydown', e => {
   if (e.repeat) return;
+  if (S === 'entry') { entryKey(e); return; }
   if (e.code === 'Space' || e.code === 'Enter' || e.code === 'ArrowDown') { e.preventDefault(); press(e, null); }
 });
 document.addEventListener('contextmenu', e => e.preventDefault());
@@ -804,6 +985,8 @@ window.__drop = {
   tap: () => tap(performance.now()),
   start: startRun,
   skipBanner: () => { if (S === 'banner') beginLevel(); },
+  endRun: (sc, why) => { score = shownScore = sc; caught = 3; dead = why || 'LEVEL FAILED'; finishRun(); },
+  lb: () => ({ S, board, entry, lbNote, highlight, boardFrom }),
   goto: lv => { startRun(); banner.lv = lv; beginLevel(); },
   state: () => ({ S, level, idx, hp, dead, lost, score, caught, fakes, streak, maxStreak, accuracy: accuracyPct(), best, log: log.slice(),
     bar: bar && { kind: bar.kind, top: bar.top, h: bar.h, vy: bar.vy, g: bar.g, off: bar.off, segs: bar.segs, phase: bar.phase, pt: bar.pt, tell: bar.tell, wait: bar.wait },

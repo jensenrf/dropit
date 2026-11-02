@@ -13,6 +13,12 @@ A one-button reflex game. Bars ride in on a rail, a clamp rattles and lets go, a
 - New twists as you climb: moving target (L2), spiked sections that cost 1 clamp health (L3), planted bombs that blow up the clamp and end the run (L4), then everything speeds up.
 - Your best score and level are saved in your browser.
 
+## Daily leaderboard
+- Finish a run in today's top 10 and you enter 3 letters/numbers, arcade style (tap the arrows or just type).
+- "Today's Top 10" is on the title screen and the game-over screen. The board resets each day at midnight Arizona time (old scores are kept in the database).
+- Backed by a small Supabase database (`scores` table, `submit_score` and `leaderboard_today` functions). The key in `index.html` is a public publishable key: the database only allows reading today's scores and submitting through `submit_score`, which checks initials, plausibility for the level reached, and that the score makes the top 10.
+- If the player is offline the game still works and just shows "leaderboard offline".
+
 ## Tweaking
 Every game-feel number (bar count, timing, gravity, scoring, fake-out odds) is in the `CFG` block at the top of the script in `index.html`.
 
