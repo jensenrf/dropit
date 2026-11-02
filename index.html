@@ -21,30 +21,46 @@
    TUNABLES  (everything you'd want to tweak while playtesting)
    ============================================================ */
 const CFG = {
-  bars: 20,                 // real bars per round (decoys don't count)
-  handY: 500,               // y of the catch line
-  groundY: 700,             // y of the platform
-  railY: 106,               // y of the conveyor rail
-  hangGap: 140,             // how far above the hand the bar's bottom hangs
-  barW: 34,
-  hMax: 200, hMin: 130,     // bar height: first bar -> last bar
-  gMin: 800, gMax: 1300,    // gravity (px/s^2): first bar -> last bar
-  enterTime: 0.55,          // carriage scroll-in time
-  exitTime: 0.5,            // carriage scroll-out time
-  waitStart: [0.6, 1.5],    // random hold before the shake starts (s), bar 1
-  waitEnd:   [0.2, 0.6],    // ... by the last bar
-  tellStart: [0.45, 0.85],  // random shake length before release (s), bar 1
-  tellEnd:   [0.20, 0.40],  // ... by the last bar
-  decoyFrom: 3,             // no fake-outs until this many real bars are done
-  decoyChance: [0.15, 0.30],// chance a fake-out precedes a bar (never two in a row)
-  fakePenalty: 25,          // points lost for tapping a fake-out (also resets combo)
-  comboStep: 0.5,           // each consecutive catch adds this to the multiplier
-  tiers: [                  // f = distance from center, 0 (center) .. 1 (edge)
+  // --- run structure ---
+  barsPerLevel: 10,         // real bars per level (fake-outs and bombs don't count)
+  passMin: 6,               // catch at least this many to clear a level
+  hpMax: 3,                 // clamp health. +1 back after each cleared level
+  // --- layout ---
+  handY: 500, groundY: 700, railY: 106, hangGap: 140, barW: 34,
+  // --- difficulty: d = (level - 1) + barIndex / barsPerLevel ---
+  hMax: 200, hMin: 150, hPerD: 5,          // bar length shrinks with d
+  gBase: 800, gPerD: 90, gMax: 1700,       // gravity (px/s^2) grows with d
+  rampLevels: 8,                           // timing reaches its floor at this d
+  waitStart: [0.6, 1.5], waitEnd: [0.15, 0.45],   // pause before the rattle (s)
+  tellStart: [0.45, 0.85], tellEnd: [0.15, 0.30], // rattle length before release (s)
+  enterTime: 0.55, exitTime: 0.5,
+  // --- fake-outs ---
+  decoyChance: 0.15, decoyPerD: 0.02, decoyMax: 0.35,   // chance a fake-out precedes a bar
+  dipMin: 11, dipMax: 44,                  // how far a fake-out bar visibly drops (px), L1 -> L4+
+  fakePenalty: 25,                         // points lost (and combo reset) for tapping a non-bar
+  // --- moving target: max offset from center, by level (fraction of half-length) ---
+  targetOffMax: [0, 0.25, 0.5, 0.7],
+  // --- traps ---
+  ghostFrom: 3, ghostChance: 0.5,          // dashed sections you slip through
+  spikeFrom: 4, spikeChance: 0.45,         // spiked sections that damage the clamp
+  bombFrom: 5, bombChance: 0.12,           // bombs: never catch one
+  // --- scoring ---
+  comboStep: 0.5,
+  tiers: [                  // f = distance from target, 0 (dead on) .. 1 (half a bar away)
     { name: 'PERFECT', f: 0.20, mult: 10, color: '#ffe066' },
     { name: 'GREAT',   f: 0.45, mult: 5,  color: '#5ef2c2' },
     { name: 'GOOD',    f: 0.75, mult: 2,  color: '#6cb8ff' },
     { name: 'EDGE',    f: 1.01, mult: 1,  color: '#c3c9dd' },
   ],
+};
+const BOMB_H = 48;
+const LEVEL_INFO = {
+  1: ['CATCH THE BAR', 'Aim for the glowing middle'],
+  2: ['NEW: MOVING TARGET', 'Aim for the glowing zone'],
+  3: ['NEW: GHOST SECTIONS', 'Dashed parts slip right through'],
+  4: ['NEW: SPIKES', 'Spikes damage your clamp'],
+  5: ['NEW: BOMBS', 'Never catch a bomb'],
+  6: ['SPEED UP', 'Everything gets faster from here'],
 };
 
 /* ============================================================
@@ -68,8 +84,8 @@ const lerp = (a, b, t) => a + (b - a) * t;
 const rand = (a, b) => a + Math.random() * (b - a);
 const ease = t => 1 - Math.pow(1 - t, 3);
 const easeIn = t => t * t * t;
-function loadBest() { try { return +localStorage.getItem('dropit_best') || 0; } catch (e) { return 0; } }
-function saveBest(v) { try { localStorage.setItem('dropit_best', String(v)); } catch (e) {} }
+function loadNum(k) { try { return +localStorage.getItem(k) || 0; } catch (e) { return 0; } }
+function saveNum(k, v) { try { localStorage.setItem(k, String(v)); } catch (e) {} }
 
 function rr(x, y, w, h, r) {
   r = Math.min(r, w / 2, h / 2);
@@ -107,50 +123,96 @@ function buzz(ms) { try { navigator.vibrate && navigator.vibrate(ms); } catch (e
 /* ============================================================
    GAME STATE
    ============================================================ */
-// S: 'title' | 'hang' | 'fall' | 'settle' | 'results'
-// While S === 'hang' the bar has a phase: enter | wait | shake | hitch | hold | exit
+// S: 'title' | 'banner' | 'hang' | 'fall' | 'settle' | 'results'
+// While S === 'hang' the item has a phase: enter | wait | shake | hitch | hold | exit
 let S = 'title';
-let bar = null, idx = 0, timer = 0, lastWasDecoy = false;
-let score = 0, shownScore = 0, caught = 0, missed = 0, fakes = 0, streak = 0, maxStreak = 0, accSum = 0;
+let bar = null, idx = 0, timer = 0, lastSpecial = false;
+let level = 1, hp = CFG.hpMax, lost = 0, dead = null, banner = null, hpHit = 0;
+let score = 0, shownScore = 0, caught = 0, fakes = 0, streak = 0, maxStreak = 0, accSum = 0;
 let tierCounts = [0, 0, 0, 0];
-let log = [];                 // per-bar result: tier index, or -1 for miss
-let best = loadBest(), newBest = false;
+let log = [];                 // this level: tier index, -1 miss, -2 spiked
+let best = loadNum('dropit_best'), bestLevel = loadNum('dropit_best_level'), newBest = false;
 let particles = [], texts = [];
 let handGap = 66, handHold = 0, handClosedGap = 7;
 let shake = 0, flash = 0, flashColor = '#fff';
 let resLock = 0, lastFrame = performance.now();
 let toast = null;
+const dbg = { next: null };
 const shareBtn = { x: 70, y: 530, w: 280, h: 50 };
 
-function newBar(i, decoy) {
-  const t = CFG.bars > 1 ? Math.min(1, i / (CFG.bars - 1)) : 0;
-  const h = lerp(CFG.hMax, CFG.hMin, t);
+/* ---------- building the next item ---------- */
+function makeSegs(off) {
+  // Segments are fractions along the bar, 0 = top .. 1 = bottom. Keep them off the target.
+  const segs = [];
+  const uT = 0.5 + off * 0.5, avoid = [uT - 0.13, uT + 0.13];
+  const place = (type, len) => {
+    for (let n = 0; n < 14; n++) {
+      const a = rand(0.04, 0.96 - len), b = a + len;
+      if (b > avoid[0] && a < avoid[1]) continue;
+      if (segs.some(s => b > s.a - 0.04 && a < s.b + 0.04)) continue;
+      segs.push({ type, a, b }); return;
+    }
+  };
+  if (level >= CFG.ghostFrom && Math.random() < CFG.ghostChance) place('ghost', rand(0.16, 0.22));
+  if (level >= 7 && Math.random() < 0.3) place('ghost', rand(0.14, 0.18));
+  if (level >= CFG.spikeFrom && Math.random() < CFG.spikeChance) place('spike', rand(0.14, 0.2));
+  return segs;
+}
+
+function newBar(i, kind, ov) {
+  ov = ov || {};
+  const d = (level - 1) + i / CFG.barsPerLevel;
+  const t = Math.min(1, d / CFG.rampLevels);
+  const h = kind === 'bomb' ? BOMB_H : Math.max(CFG.hMin, CFG.hMax - CFG.hPerD * d);
   const w0 = lerp(CFG.waitStart[0], CFG.waitEnd[0], t), w1 = lerp(CFG.waitStart[1], CFG.waitEnd[1], t);
   const k0 = lerp(CFG.tellStart[0], CFG.tellEnd[0], t), k1 = lerp(CFG.tellStart[1], CFG.tellEnd[1], t);
   const top0 = CFG.handY - CFG.hangGap - h;
+  let off = 0, segs = [];
+  if (kind !== 'bomb') {
+    const mo = CFG.targetOffMax[Math.min(level - 1, CFG.targetOffMax.length - 1)];
+    off = ov.off !== undefined ? ov.off : (mo ? rand(-mo, mo) : 0);
+    segs = ov.segs || makeSegs(off);
+  }
   bar = {
-    i, h, g: lerp(CFG.gMin, CFG.gMax, t), decoy,
-    top: top0, top0, vy: 0, cx: -60, x: -60, ox: 0, oy: 0, dip: 0, jaw: CFG.barW / 2,
-    phase: 'enter', pt: 0, wait: rand(w0, w1) * (decoy ? 0.8 : 1), tell: rand(k0, k1), rattle: 0,
-    released: false, exitT: 0, penalized: false,
+    i, h, kind, g: Math.min(CFG.gMax, CFG.gBase + CFG.gPerD * d),
+    off, segs,
+    top: top0, top0, vy: 0, cx: -60, x: -60, ox: 0, oy: 0, dip: 0, cdip: 0, jaw: CFG.barW / 2,
+    phase: 'enter', pt: 0, wait: rand(w0, w1) * (kind === 'decoy' ? 0.8 : 1), tell: rand(k0, k1), rattle: 0,
+    released: false, exitT: 0, penalized: false, clanked: false, hidden: false,
     free: false, caught: false, landed: false, tier: -1, f: 1,
   };
   timer = 0;
 }
 
 function spawn() {
-  const t = CFG.bars > 1 ? idx / (CFG.bars - 1) : 0;
-  const decoy = !lastWasDecoy && idx >= CFG.decoyFrom && Math.random() < lerp(CFG.decoyChance[0], CFG.decoyChance[1], t);
-  lastWasDecoy = decoy;
-  newBar(idx, decoy);
+  const d = (level - 1) + idx / CFG.barsPerLevel;
+  let kind = 'bar';
+  const ov = dbg.next; dbg.next = null;
+  if (ov && ov.kind) kind = ov.kind;
+  else if (!lastSpecial && idx >= (level === 1 ? 3 : 1)) {
+    const pb = level >= CFG.bombFrom ? CFG.bombChance : 0;
+    const pd = Math.min(CFG.decoyMax, CFG.decoyChance + CFG.decoyPerD * d);
+    const r = Math.random();
+    if (r < pb) kind = 'bomb'; else if (r < pb + pd) kind = 'decoy';
+  }
+  lastSpecial = kind !== 'bar';
+  newBar(idx, kind, ov);
   S = 'hang';
 }
 
-function startRound() {
-  score = shownScore = caught = missed = fakes = streak = maxStreak = 0;
-  accSum = 0; tierCounts = [0, 0, 0, 0]; log = []; newBest = false;
-  particles = []; texts = []; idx = 0; handHold = 0; lastWasDecoy = false;
-  spawn();
+function startBanner(lv, cleared) {
+  banner = { lv, cleared, t: 0 };
+  bar = null; S = 'banner'; texts = [];
+}
+function beginLevel() {
+  level = banner.lv; idx = 0; lost = 0; log = []; lastSpecial = false;
+  banner = null; spawn();
+}
+function startRun() {
+  score = shownScore = caught = fakes = streak = maxStreak = 0;
+  accSum = 0; tierCounts = [0, 0, 0, 0]; newBest = false; dead = null;
+  particles = []; texts = []; handHold = 0; hp = CFG.hpMax; hpHit = 0; level = 1;
+  startBanner(1, false);
 }
 
 /* ============================================================
@@ -165,45 +227,96 @@ function burst(x, y, color, n, speed) {
     particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - speed * 0.3, life: rand(0.35, 0.7), max: 0.7, color, r: rand(2, 4.5) });
   }
 }
+function whiff() { handHold = 0.18; handClosedGap = 6; }
+
+function lostBar() {
+  lost++;
+  if (!dead && lost > CFG.barsPerLevel - CFG.passMin) dead = 'LEVEL FAILED';
+}
 
 function endBarMiss(label) {
   S = 'settle'; timer = 0;
-  streak = 0; missed++; log.push(-1);
+  streak = 0; log.push(-1); lostBar();
   addText(W / 2, CFG.handY - 70, label, '#ff6b6b', 30, 1.0);
   shake = Math.max(shake, 7);
   tone(150, 0.25, 'sawtooth', 0.09); buzz(60);
 }
 
+function openJaws() { bar.released = true; bar.free = true; bar.jaw = CFG.barW / 2 + 16; bar.x = W / 2; bar.ox = 0; bar.oy = 0; bar.dip = 0; bar.cdip = 0; }
+
 function releaseBar() {
-  // Real drop: clamp opens, bar falls.
-  bar.released = true; bar.free = true; bar.jaw = CFG.barW / 2 + 16;
-  bar.x = W / 2; bar.ox = 0; bar.oy = 0; bar.phase = 'fall';
-  S = 'fall';
+  openJaws(); bar.phase = 'fall'; S = 'fall';
   tone(95, 0.12, 'square', 0.1); tone(60, 0.16, 'sawtooth', 0.07, 0.02);
 }
 
 function falseStart() {
-  // Tapped before the bar was released / in reach.
-  if (!bar.released) { bar.released = true; bar.free = true; bar.jaw = CFG.barW / 2 + 16; bar.x = W / 2; bar.ox = 0; bar.oy = 0; }
-  handHold = 0.18; handClosedGap = 6;
+  if (!bar.released) openJaws();
+  whiff();
   endBarMiss('TOO EARLY');
 }
 
 function fakePenalty() {
-  // Tapped a fake-out: combo gone, points docked, bar carries on and leaves.
+  // Tapped something that isn't a catchable bar: combo gone, points docked.
   bar.penalized = true; fakes++; streak = 0;
-  const lost = Math.min(score, CFG.fakePenalty); score -= lost;
-  handHold = 0.18; handClosedGap = 6;
-  addText(W / 2, CFG.handY - 70, 'FAKE-OUT!', '#ff9f43', 30, 1.0);
-  if (lost) addText(W / 2, CFG.handY - 38, '-' + lost, '#ff6b6b', 24, 1.0);
+  const lost2 = Math.min(score, CFG.fakePenalty); score -= lost2;
+  whiff();
+  addText(W / 2, CFG.handY - 70, bar.kind === 'bomb' ? 'NOT YET!' : 'FAKE-OUT!', '#ff9f43', 30, 1.0);
+  if (lost2) addText(W / 2, CFG.handY - 38, '-' + lost2, '#ff6b6b', 24, 1.0);
   shake = Math.max(shake, 6);
   tone(200, 0.2, 'sawtooth', 0.09); tone(140, 0.2, 'square', 0.07, 0.08); buzz(60);
 }
 
-function doCatch(top) {
+function boom(x, y) {
+  burst(x, y, '#ffb347', 46, 520); burst(x, y, '#ff5a3c', 30, 380); burst(x, y, '#ffe066', 18, 260);
+  flash = 0.75; flashColor = '#fff'; shake = 16;
+  tone(70, 0.5, 'sawtooth', 0.18); tone(45, 0.6, 'square', 0.14, 0.02); buzz(180);
+}
+
+function explodeBomb() {
+  dead = 'BOMB'; bar.caught = true; bar.hidden = true;
+  S = 'settle'; timer = 0; streak = 0;
+  boom(W / 2, CFG.handY);
+  addText(W / 2, CFG.handY - 70, 'BOOM', '#ff5a3c', 44, 1.2);
+}
+
+function slip() {
+  // Hand closed on a ghost section: nothing there.
+  bar.free = true; bar.caught = false;
+  S = 'settle'; timer = 0;
+  streak = 0; log.push(-1); lostBar(); whiff();
+  addText(W / 2, CFG.handY - 70, 'SLIPPED', '#ff6b6b', 30, 1.0);
+  shake = Math.max(shake, 5);
+  tone(180, 0.2, 'sawtooth', 0.08); buzz(40);
+}
+
+function spikeHit(top) {
   bar.top = top; bar.vy = 0; bar.caught = true; bar.free = false;
-  const cy = top + bar.h / 2;
-  const f = Math.min(1, Math.abs(cy - CFG.handY) / (bar.h / 2));
+  S = 'settle'; timer = 0;
+  streak = 0; log.push(-2); lostBar();
+  hp = Math.max(0, hp - 1); hpHit = 0.6;
+  handHold = 0.5; handClosedGap = CFG.barW / 2 + 1;
+  burst(W / 2, CFG.handY, '#ff4d5a', 20, 340);
+  flash = 0.4; flashColor = '#ff4d5a'; shake = Math.max(shake, 9);
+  tone(130, 0.25, 'sawtooth', 0.12); tone(90, 0.3, 'square', 0.1, 0.05); buzz(90);
+  if (hp <= 0) {
+    dead = 'CLAMP DESTROYED';
+    addText(W / 2, CFG.handY - 70, 'CLAMP DESTROYED', '#ff4d5a', 30, 1.2);
+    boom(W / 2, CFG.handY);
+  } else {
+    addText(W / 2, CFG.handY - 70, 'SPIKED!', '#ff4d5a', 32, 1.0);
+    addText(W / 2, CFG.handY - 38, '-1 CLAMP', '#ff9f43', 22, 1.0);
+  }
+}
+
+function doCatch(top) {
+  const u = (CFG.handY - top) / bar.h;                   // where on the bar the hand is, 0 = top .. 1 = bottom
+  const seg = bar.segs.find(s => u >= s.a && u <= s.b);
+  if (seg && seg.type === 'ghost') { slip(); return; }
+  if (seg && seg.type === 'spike') { spikeHit(top); return; }
+
+  bar.top = top; bar.vy = 0; bar.caught = true; bar.free = false;
+  const tPos = top + (0.5 + bar.off * 0.5) * bar.h;       // y of the target center
+  const f = Math.min(1, Math.abs(CFG.handY - tPos) / (bar.h / 2));
   let ti = CFG.tiers.findIndex(t => f <= t.f); if (ti < 0) ti = CFG.tiers.length - 1;
   const tier = CFG.tiers[ti];
   streak++; maxStreak = Math.max(maxStreak, streak);
@@ -226,32 +339,43 @@ function doCatch(top) {
 
 function tap(ts) {
   if (S === 'hang') {
-    if (bar.decoy) {
+    if (bar.kind !== 'bar') {                              // fake-out or bomb: hands off
       if (bar.phase !== 'exit' && !bar.penalized) fakePenalty();
       return;
     }
     falseStart(); return;
   }
   if (S !== 'fall') return;
-  // Advance the bar to the exact moment of the input, not the last frame.
+  // Advance the item to the exact moment of the input, not the last frame.
   const extra = Math.max(0, Math.min(0.034, ((ts || performance.now()) - lastFrame) / 1000));
   const top = bar.top + bar.vy * extra + 0.5 * bar.g * extra * extra;
   const bottom = top + bar.h;
-  if (bottom < CFG.handY) { falseStart(); return; }   // not in reach yet
-  if (top > CFG.handY) return;                        // already slipped past
+  if (top > CFG.handY) return;                             // already slipped past
+  if (bar.kind === 'bomb') {
+    if (bottom < CFG.handY) { if (!bar.penalized) fakePenalty(); return; }
+    explodeBomb(); return;
+  }
+  if (bottom < CFG.handY) { falseStart(); return; }        // not in reach yet
   doCatch(top);
 }
 
-function finishRound() {
-  S = 'results'; resLock = 0.55;
-  if (score > best) { best = score; newBest = true; saveBest(best); }
+function finishRun() {
+  S = 'results'; resLock = 0.6;
+  if (score > best) { best = score; newBest = true; saveNum('dropit_best', best); }
+  if (level > bestLevel) { bestLevel = level; saveNum('dropit_best_level', bestLevel); }
+  tone(300, 0.2, 'triangle', 0.1); tone(240, 0.2, 'triangle', 0.1, 0.12); tone(180, 0.4, 'triangle', 0.1, 0.24);
+}
+
+function levelClear() {
+  hp = Math.min(CFG.hpMax, hp + 1);
   tone(392, 0.15, 'triangle', 0.1); tone(523, 0.15, 'triangle', 0.1, 0.1); tone(659, 0.3, 'triangle', 0.1, 0.2);
+  startBanner(level + 1, true);
 }
 
 function accuracyPct() { return caught ? Math.round(accSum / caught * 100) : 0; }
 
 function shareText() {
-  return `drop_it  |  ${score} pts  |  ${caught}/${CFG.bars} caught  |  ${accuracyPct()}% accuracy`;
+  return `drop_it  |  Level ${level}  |  ${score} pts  |  ${caught} caught  |  ${accuracyPct()}% accuracy`;
 }
 function doShare() {
   const text = shareText();
@@ -282,15 +406,20 @@ function physics(dt) {
   bar.top += bar.vy * dt;
   if (bar.top + bar.h >= CFG.groundY) {
     bar.top = CFG.groundY - bar.h; bar.vy = 0; bar.landed = true;
-    if (S === 'fall') endBarMiss('MISS');
-    else shake = Math.max(shake, 3);
+    if (S === 'fall') {
+      if (bar.kind === 'bomb') {                           // a bomb that hits the floor is harmless
+        S = 'settle'; timer = 0;
+        addText(W / 2, CFG.handY - 40, 'SAFE', '#5ef2c2', 26, 0.9);
+        burst(W / 2, CFG.groundY, '#ffb347', 10, 200); tone(120, 0.1, 'sine', 0.05);
+      } else endBarMiss('MISS');
+    } else shake = Math.max(shake, 3);
   }
 }
 
 function updateHang(dt) {
   const b = bar;
   b.pt += dt;
-  b.ox = 0; b.oy = 0; b.dip = 0;
+  b.ox = 0; b.oy = 0; b.dip = 0; b.cdip = 0;
   switch (b.phase) {
     case 'enter': {
       const k = Math.min(1, b.pt / CFG.enterTime);
@@ -308,21 +437,23 @@ function updateHang(dt) {
       b.rattle -= dt;
       if (b.rattle <= 0) { tone(150 + rand(0, 70), 0.03, 'square', 0.03); b.rattle = 0.06; }
       if (b.pt >= b.tell) {
-        if (b.decoy) {
+        if (b.kind === 'decoy') {
           b.phase = 'hitch'; b.pt = 0;
           burst(b.cx, b.top0 + 6, '#ffd166', 10, 220);
-          tone(300, 0.05, 'square', 0.08); tone(90, 0.1, 'sawtooth', 0.07, 0.03);
+          tone(95, 0.12, 'square', 0.1); tone(60, 0.16, 'sawtooth', 0.07, 0.02);   // sounds just like a real release
           buzz(20);
-        } else { releaseBar(); }
+        } else releaseBar();
       }
       break;
     }
     case 'hitch': {
-      // Clamp springs, bar dips, snaps back. It never actually lets go.
-      const p = b.pt;
-      b.dip = p < 0.07 ? (p / 0.07) * 11 : p < 0.2 ? 11 * (1 - (p - 0.07) / 0.13) : 0;
-      b.jaw = CFG.barW / 2 + (p < 0.1 ? 5 : 0);
-      if (b.pt >= 0.3) { b.phase = 'hold'; b.pt = 0; b.jaw = CFG.barW / 2; }
+      // The clamp lets go, the bar really falls a little, then the clamp chases it down and re-grabs.
+      const p = b.pt, amp = lerp(CFG.dipMin, CFG.dipMax, Math.min(1, (level - 1) / 3));
+      const f = q => q <= 0 ? 0 : q < 0.09 ? amp * (1 - Math.pow(1 - q / 0.09, 2)) : q < 0.13 ? amp : q < 0.26 ? amp * (1 - (q - 0.13) / 0.13) : 0;
+      b.dip = f(p); b.cdip = f(p - 0.06);
+      b.jaw = CFG.barW / 2 + ((b.dip - b.cdip) > 3 ? 14 : 0);
+      if (!b.clanked && p >= 0.2) { b.clanked = true; tone(260, 0.05, 'square', 0.07); tone(110, 0.08, 'sawtooth', 0.05, 0.02); }
+      if (p >= 0.34) { b.phase = 'hold'; b.pt = 0; b.jaw = CFG.barW / 2; }
       break;
     }
     case 'hold':
@@ -343,8 +474,12 @@ function update(dt) {
   const target = handHold > 0 ? handClosedGap : 66;
   handHold = Math.max(0, handHold - dt);
   handGap += (target - handGap) * Math.min(1, dt * 28);
+  hpHit = Math.max(0, hpHit - dt);
 
-  if (S === 'hang') updateHang(dt);
+  if (S === 'banner') {
+    banner.t += dt;
+    if (banner.t >= 2.6) beginLevel();
+  } else if (S === 'hang') updateHang(dt);
 
   if (S === 'fall' && !bar.landed) {
     // sub-step so landing/catch timing is consistent across frame rates
@@ -353,9 +488,13 @@ function update(dt) {
   } else if (S === 'settle') {
     timer += dt;
     if (bar.free && !bar.landed) physics(dt);
-    if (timer >= 0.8 && (bar.landed || bar.caught)) {
-      idx++;
-      if (idx >= CFG.bars) finishRound(); else spawn();
+    if (timer >= (dead ? 1.4 : 0.8) && (bar.landed || bar.caught)) {
+      if (dead) finishRun();
+      else if (bar.kind === 'bomb') spawn();              // bombs aren't one of the level's bars
+      else {
+        idx++;
+        if (idx >= CFG.barsPerLevel) levelClear(); else spawn();
+      }
     }
   } else if (S === 'results') {
     resLock = Math.max(0, resLock - dt);
@@ -403,12 +542,11 @@ function drawRail() {
   for (let x = 14; x < W; x += 42) { ctx.beginPath(); ctx.arc(x, y, 2.2, 0, 7); ctx.fill(); }
 }
 
-// Carriage + arm + crossbar (drawn behind the bar). Jaws are drawn over the bar.
+// Carriage + arm + crossbar (behind the item). Jaws are drawn over it.
 function drawClamp(b, front) {
   const jitterX = b.released ? 0 : b.ox, jitterY = b.released ? 0 : b.oy;
-  const cx = b.cx + jitterX, crossY = b.top0 - 10 + jitterY;
+  const cx = b.cx + jitterX, crossY = b.top0 - 10 + jitterY + b.cdip;
   if (!front) {
-    // carriage on the rail
     ctx.fillStyle = '#1a2040';
     ctx.beginPath(); ctx.arc(cx - 15, CFG.railY, 7, 0, 7); ctx.arc(cx + 15, CFG.railY, 7, 0, 7); ctx.fill();
     ctx.fillStyle = '#6a77c0';
@@ -417,14 +555,11 @@ function drawClamp(b, front) {
     cg.addColorStop(0, '#6370b8'); cg.addColorStop(1, '#343c75');
     ctx.fillStyle = cg; rr(cx - 26, CFG.railY + 4, 52, 28, 7); ctx.fill();
     ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth = 1.5; rr(cx - 26, CFG.railY + 4, 52, 28, 7); ctx.stroke();
-    // hydraulic arm
     ctx.fillStyle = '#8590d8'; ctx.fillRect(cx - 4, CFG.railY + 30, 8, Math.max(0, crossY - (CFG.railY + 30)));
     ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.fillRect(cx + 1, CFG.railY + 30, 3, Math.max(0, crossY - (CFG.railY + 30)));
-    // crossbar
     ctx.fillStyle = '#9aa6f0'; rr(cx - 30, crossY - 4, 60, 10, 4); ctx.fill();
   } else {
-    // jaws gripping the bar top
-    const jy = b.top0 - 4 + jitterY;
+    const jy = b.top0 - 4 + jitterY + b.cdip;
     ctx.fillStyle = '#c3cbff';
     rr(cx - b.jaw - 9, jy, 9, 28, 3); ctx.fill();
     rr(cx + b.jaw, jy, 9, 28, 3); ctx.fill();
@@ -434,42 +569,102 @@ function drawClamp(b, front) {
   }
 }
 
+function drawBomb(b) {
+  const x = b.x + (b.released ? 0 : b.ox);
+  const y = b.top + (b.released ? 0 : b.oy) + b.dip;
+  const cx = x, cy = y + 27, r = 24;
+  const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 110);
+  ctx.fillStyle = `rgba(255,70,50,${0.12 + 0.18 * pulse})`;
+  ctx.beginPath(); ctx.arc(cx, cy, r + 8 + pulse * 4, 0, 7); ctx.fill();
+  const g = ctx.createRadialGradient(cx - 8, cy - 9, 3, cx, cy, r);
+  g.addColorStop(0, '#6a6f86'); g.addColorStop(0.5, '#2a2d3f'); g.addColorStop(1, '#0c0d16');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, cy, r, 0, 7); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.18)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(cx - 3, cy - 3, r - 6, Math.PI * 1.05, Math.PI * 1.45); ctx.stroke();
+  // red warning band
+  ctx.fillStyle = '#ff4d5a'; rr(cx - 12, cy - 3, 24, 6, 3); ctx.fill();
+  // fuse + spark
+  ctx.strokeStyle = '#c9a56a'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(cx + 6, cy - r + 2); ctx.quadraticCurveTo(cx + 14, cy - r - 8, cx + 8, cy - r - 14); ctx.stroke();
+  const fl = 0.6 + 0.4 * Math.sin(performance.now() / 50);
+  ctx.fillStyle = `rgba(255,${Math.round(180 + 60 * fl)},60,1)`;
+  ctx.beginPath(); ctx.arc(cx + 8, cy - r - 14, 4 + 2 * fl, 0, 7); ctx.fill();
+}
+
 function drawBar(b) {
+  if (b.hidden) return;
+  if (b.kind === 'bomb') { drawBomb(b); return; }
   const w = CFG.barW, h = b.h;
   const x = b.x + (b.released ? 0 : b.ox) - w / 2;
   const y = b.top + (b.released ? 0 : b.oy) + b.dip;
+  const ghosts = b.segs.filter(s => s.type === 'ghost').sort((p, q) => p.a - q.a);
+  const solids = []; let cur = 0;
+  for (const s of ghosts) { if (s.a > cur) solids.push([cur, s.a]); cur = s.b; }
+  if (cur < 1) solids.push([cur, 1]);
+  const ty = y + (0.5 + b.off * 0.5) * h, half = h / 2;
+
   ctx.save();
   rr(x, y, w, h, 8); ctx.clip();
+  ctx.beginPath(); for (const [a, c] of solids) ctx.rect(x, y + a * h, w, (c - a) * h); ctx.clip();
   const g = ctx.createLinearGradient(x, 0, x + w, 0);
   g.addColorStop(0, '#f0a030'); g.addColorStop(0.5, '#ffe08a'); g.addColorStop(1, '#e08a20');
   ctx.fillStyle = g; ctx.fillRect(x, y, w, h);
-  const cy = y + h / 2, half = h / 2;
-  // scoring zones, wide to narrow
+  // scoring zones around the target, wide to narrow
   const zones = [[0.75, 'rgba(110,184,255,.35)'], [0.45, 'rgba(94,242,194,.55)'], [0.20, 'rgba(255,255,255,.9)']];
-  for (const [f, col] of zones) { ctx.fillStyle = col; ctx.fillRect(x, cy - half * f, w, half * f * 2); }
+  for (const [f, col] of zones) { ctx.fillStyle = col; ctx.fillRect(x, ty - half * f, w, half * f * 2); }
   // ruler ticks
   ctx.strokeStyle = 'rgba(60,35,0,.45)'; ctx.lineWidth = 1.5;
   for (let k = 1; k < 10; k++) {
-    const ty = y + (h * k) / 10, len = k === 5 ? 0 : (k % 5 === 0 ? 10 : 6);
-    ctx.beginPath(); ctx.moveTo(x, ty); ctx.lineTo(x + len, ty); ctx.moveTo(x + w, ty); ctx.lineTo(x + w - len, ty); ctx.stroke();
+    const tk = y + (h * k) / 10, len = k % 5 === 0 ? 10 : 6;
+    ctx.beginPath(); ctx.moveTo(x, tk); ctx.lineTo(x + len, tk); ctx.moveTo(x + w, tk); ctx.lineTo(x + w - len, tk); ctx.stroke();
   }
-  // center line
+  // spike sections: red wash
+  for (const s of b.segs) if (s.type === 'spike') {
+    ctx.fillStyle = 'rgba(210,30,55,.6)'; ctx.fillRect(x, y + s.a * h, w, (s.b - s.a) * h);
+    ctx.strokeStyle = 'rgba(80,0,10,.5)'; ctx.lineWidth = 2;
+    for (let k = y + s.a * h - w; k < y + s.b * h; k += 8) { ctx.beginPath(); ctx.moveTo(x, k + w); ctx.lineTo(x + w, k); ctx.stroke(); }
+  }
+  // target line
   ctx.strokeStyle = '#2a1b00'; ctx.lineWidth = 2;
-  ctx.beginPath(); ctx.moveTo(x, cy); ctx.lineTo(x + w, cy); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x, ty); ctx.lineTo(x + w, ty); ctx.stroke();
   ctx.restore();
-  ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth = 2; rr(x, y, w, h, 8); ctx.stroke();
+
+  // outline per solid piece
+  ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth = 2;
+  if (solids.length === 1 && solids[0][0] === 0 && solids[0][1] === 1) { rr(x, y, w, h, 8); ctx.stroke(); }
+  else for (const [a, c] of solids) ctx.strokeRect(x, y + a * h, w, (c - a) * h);
+
+  // ghost sections: see-through, dashed
+  for (const s of ghosts) {
+    ctx.fillStyle = 'rgba(160,180,255,.07)'; ctx.fillRect(x, y + s.a * h, w, (s.b - s.a) * h);
+    ctx.setLineDash([5, 4]); ctx.strokeStyle = 'rgba(200,214,255,.75)'; ctx.lineWidth = 2;
+    ctx.strokeRect(x + 1, y + s.a * h, w - 2, (s.b - s.a) * h); ctx.setLineDash([]);
+  }
+  // spikes poking out both sides
+  ctx.fillStyle = '#ff4d5a';
+  for (const s of b.segs) if (s.type === 'spike') {
+    const n = Math.max(2, Math.round((s.b - s.a) * h / 9)), step = ((s.b - s.a) * h) / n;
+    for (let k = 0; k < n; k++) {
+      const sy = y + s.a * h + k * step;
+      ctx.beginPath(); ctx.moveTo(x, sy + 1); ctx.lineTo(x - 9, sy + step / 2); ctx.lineTo(x, sy + step - 1); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(x + w, sy + 1); ctx.lineTo(x + w + 9, sy + step / 2); ctx.lineTo(x + w, sy + step - 1); ctx.fill();
+    }
+  }
+  // target markers
+  ctx.fillStyle = '#fff'; ctx.strokeStyle = '#2a1b00'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(x - 13, ty - 7); ctx.lineTo(x - 13, ty + 7); ctx.lineTo(x - 3, ty); ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x + w + 13, ty - 7); ctx.lineTo(x + w + 13, ty + 7); ctx.lineTo(x + w + 3, ty); ctx.closePath(); ctx.fill(); ctx.stroke();
 }
 
 function drawHand() {
   const y = CFG.handY, cx = W / 2;
-  const lit = handHold > 0 && bar && bar.caught ? CFG.tiers[bar.tier].color : '#9fb0ff';
+  const lit = handHold > 0 && bar && bar.caught && bar.tier >= 0 ? CFG.tiers[bar.tier].color : '#9fb0ff';
   ctx.fillStyle = '#242c57';
   rr(-20, y - 13, cx - handGap + 20 - 24, 26, 13); ctx.fill();
   rr(cx + handGap + 24, y - 13, W - (cx + handGap + 24) + 20, 26, 13); ctx.fill();
   ctx.fillStyle = lit;
   rr(cx - handGap - 28, y - 16, 28, 32, 10); ctx.fill();
   rr(cx + handGap, y - 16, 28, 32, 10); ctx.fill();
-  // faint catch line
   ctx.strokeStyle = 'rgba(159,176,255,.16)'; ctx.setLineDash([6, 8]); ctx.lineWidth = 1.5;
   ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(cx - handGap - 30, y); ctx.moveTo(cx + handGap + 30, y); ctx.lineTo(W, y); ctx.stroke();
   ctx.setLineDash([]);
@@ -479,7 +674,6 @@ function drawScene() {
   const bg = ctx.createLinearGradient(0, 0, 0, H);
   bg.addColorStop(0, '#0b1020'); bg.addColorStop(1, '#1b2150');
   ctx.fillStyle = bg; ctx.fillRect(-20, -20, W + 40, H + 40);
-  // platform
   const pg = ctx.createLinearGradient(0, CFG.groundY, 0, H);
   pg.addColorStop(0, '#39427a'); pg.addColorStop(1, '#171c40');
   ctx.fillStyle = pg; ctx.fillRect(-20, CFG.groundY, W + 40, H - CFG.groundY + 20);
@@ -495,17 +689,37 @@ function drawScene() {
   for (const t of texts) text(t.text, t.x, t.y, t.size, t.color, 'center', 800, Math.min(1, (t.life / t.max) * 1.6));
 }
 
+// Little clamp icons for health.
+function drawHp(x, y, n, size, flashIdx) {
+  for (let i = 0; i < CFG.hpMax; i++) {
+    const px = x + i * (size + 8), alive = i < n;
+    const hit = i === flashIdx && hpHit > 0;
+    ctx.fillStyle = hit ? '#ff4d5a' : alive ? '#9fb0ff' : 'rgba(255,255,255,.1)';
+    rr(px, y, size, size, 5); ctx.fill();
+    if (alive || hit) {
+      ctx.fillStyle = '#1a2040';
+      rr(px + size * 0.3, y + size * 0.2, size * 0.4, size * 0.6, 2); ctx.fill();
+      ctx.fillStyle = hit ? '#ff4d5a' : '#9fb0ff';
+      ctx.fillRect(px + size * 0.42, y + size * 0.25, size * 0.16, size * 0.3);
+    } else {
+      ctx.strokeStyle = 'rgba(255,255,255,.25)'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(px + 5, y + 5); ctx.lineTo(px + size - 5, y + size - 5); ctx.moveTo(px + size - 5, y + 5); ctx.lineTo(px + 5, y + size - 5); ctx.stroke();
+    }
+  }
+}
+
 function drawHUD() {
-  // progress pips
-  const n = CFG.bars, gap = (W - 48) / n;
+  const n = CFG.barsPerLevel, gap = (W - 48) / n;
   for (let i = 0; i < n; i++) {
     const x = 24 + gap * (i + 0.5);
     let col = 'rgba(255,255,255,.18)';
-    if (i < log.length) col = log[i] < 0 ? '#ff6b6b' : CFG.tiers[log[i]].color;
-    else if (i === idx && S !== 'results' && !(bar && bar.decoy)) col = '#fff';
-    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, 20, 5, 0, 7); ctx.fill();
+    if (i < log.length) col = log[i] === -1 ? '#ff6b6b' : log[i] === -2 ? '#ff9f43' : CFG.tiers[log[i]].color;
+    else if (i === idx && (S === 'hang' || S === 'fall')) col = '#fff';
+    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, 20, 6, 0, 7); ctx.fill();
   }
   text(String(Math.round(shownScore)), 24, 60, 40, '#fff', 'left', 800);
+  text('LEVEL ' + level, W / 2, 56, 15, '#8d97d6', 'center', 800);
+  drawHp(24, 84, hp, 16, hp);   // the slot that was just lost flashes
   if (streak >= 2) {
     const mult = 1 + CFG.comboStep * (streak - 1);
     text('x' + mult.toFixed(1), W - 24, 56, 28, '#ffe066', 'right', 800);
@@ -515,40 +729,54 @@ function drawHUD() {
 
 function overlayDim(a) { ctx.fillStyle = `rgba(6,9,22,${a})`; ctx.fillRect(-20, -20, W + 40, H + 40); }
 
+function drawBanner() {
+  overlayDim(0.78);
+  const k = Math.min(1, banner.t / 0.25);
+  text(banner.cleared ? 'LEVEL CLEAR' : 'GET READY', W / 2, 200, 16, banner.cleared ? '#5ef2c2' : '#8d97d6', 'center', 800);
+  text('LEVEL ' + banner.lv, W / 2, 262, 60, '#fff', 'center', 800, k);
+  const info = LEVEL_INFO[Math.min(banner.lv, 6)];
+  text(info[0], W / 2, 342, 22, '#ffe066', 'center', 800);
+  text(info[1], W / 2, 374, 15, '#aab4ee', 'center', 500);
+  text(`Catch ${CFG.passMin} of ${CFG.barsPerLevel} to advance`, W / 2, 430, 15, '#8d97d6', 'center', 500);
+  if (banner.cleared) text('+1 CLAMP', W / 2, 482, 18, '#5ef2c2', 'center', 800);
+  const iw = CFG.hpMax * 28 - 8;
+  drawHp(W / 2 - iw / 2, 505, hp, 20, -1);
+  const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 350);
+  text('TAP TO SKIP', W / 2, 640, 14, '#8d97d6', 'center', 700, banner.t > 0.5 ? 0.4 + 0.5 * pulse : 0);
+}
+
 function drawTitle() {
   overlayDim(0.72);
   text('drop_it', W / 2, 250, 64, '#fff', 'center', 800);
-  text('catch the bar. aim for the middle.', W / 2, 298, 16, '#aab4ee', 'center', 500);
-  const lines = ['Wait for the clamp to let go, then tap.', 'Tap too early and it counts as a miss.', 'Beware fake-outs: the clamp can jam.'];
+  text('catch the bar. hit the glow.', W / 2, 298, 16, '#aab4ee', 'center', 500);
+  const lines = ['Wait for the clamp to let go, then tap.', `Catch ${CFG.passMin} of ${CFG.barsPerLevel} bars to clear a level.`, 'Watch for fake-outs. Never catch a bomb.'];
   lines.forEach((l, i) => text(l, W / 2, 350 + i * 26, 15, '#8d97d6', 'center', 500));
   const pulse = 0.65 + 0.35 * Math.sin(performance.now() / 350);
   text('TAP TO START', W / 2, 610, 26, '#ffe066', 'center', 800, pulse);
-  if (best) text('BEST ' + best, W / 2, 656, 15, '#8d97d6', 'center', 700);
+  if (best) text(`BEST ${best}  -  LEVEL ${bestLevel}`, W / 2, 656, 15, '#8d97d6', 'center', 700);
 }
 
 function drawResults() {
   overlayDim(0.72);
   ctx.fillStyle = '#141a3d'; rr(30, 100, W - 60, 540, 22); ctx.fill();
   ctx.strokeStyle = 'rgba(159,176,255,.25)'; ctx.lineWidth = 2; rr(30, 100, W - 60, 540, 22); ctx.stroke();
-  text('ROUND COMPLETE', W / 2, 142, 14, '#8d97d6', 'center', 700);
-  text(String(Math.round(shownScore)), W / 2, 215, 84, '#fff', 'center', 800);
-  text(newBest ? 'NEW BEST!' : 'BEST ' + best, W / 2, 275, 16, newBest ? '#ffe066' : '#8d97d6', 'center', 800);
-  const cols = [
-    ['CAUGHT', `${caught}/${CFG.bars}`], ['ACCURACY', accuracyPct() + '%'], ['STREAK', String(maxStreak)], ['FAKED OUT', String(fakes)],
-  ];
+  text('GAME OVER', W / 2, 138, 14, '#8d97d6', 'center', 700);
+  text(dead || '', W / 2, 166, 20, '#ff6b6b', 'center', 800);
+  text(String(Math.round(shownScore)), W / 2, 232, 80, '#fff', 'center', 800);
+  text(newBest ? 'NEW BEST!' : 'BEST ' + best, W / 2, 288, 16, newBest ? '#ffe066' : '#8d97d6', 'center', 800);
+  const cols = [['LEVEL', String(level)], ['CAUGHT', String(caught)], ['ACCURACY', accuracyPct() + '%'], ['STREAK', String(maxStreak)]];
   cols.forEach(([k, v], i) => {
     const x = 30 + (W - 60) * (i + 0.5) / 4;
-    text(v, x, 340, 28, i === 3 && fakes ? '#ff9f43' : '#fff', 'center', 800);
-    text(k, x, 370, 10, '#8d97d6', 'center', 700);
+    text(v, x, 346, 28, '#fff', 'center', 800);
+    text(k, x, 376, 10, '#8d97d6', 'center', 700);
   });
-  // tier breakdown
   CFG.tiers.forEach((t, i) => {
     const x = 30 + (W - 60) * (i + 0.5) / 4;
     ctx.fillStyle = t.color; ctx.beginPath(); ctx.arc(x, 425, 6, 0, 7); ctx.fill();
     text(String(tierCounts[i]), x, 452, 22, '#fff', 'center', 800);
     text(t.name, x, 477, 10, '#8d97d6', 'center', 700);
   });
-  // share button
+  if (fakes) text(`Faked out ${fakes} time${fakes === 1 ? '' : 's'}`, W / 2, 504, 12, '#ff9f43', 'center', 700);
   const b = shareBtn;
   ctx.fillStyle = '#2a3270'; rr(b.x, b.y, b.w, b.h, 14); ctx.fill();
   ctx.strokeStyle = '#7f8cff'; ctx.lineWidth = 2; rr(b.x, b.y, b.w, b.h, 14); ctx.stroke();
@@ -565,7 +793,11 @@ function draw() {
   ctx.restore();
   if (flash > 0) { ctx.globalAlpha = flash; ctx.fillStyle = flashColor; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
   if (S === 'title') drawTitle();
-  else { drawHUD(); if (S === 'results') drawResults(); }
+  else {
+    drawHUD();
+    if (S === 'banner') drawBanner();
+    if (S === 'results') drawResults();
+  }
   if (toast) text(toast.msg, W / 2, 692, 15, '#5ef2c2', 'center', 800, Math.min(1, toast.life * 2));
 }
 
@@ -588,10 +820,11 @@ function inShare(p) { const b = shareBtn; return p.x >= b.x && p.x <= b.x + b.w 
 
 function press(e, pt) {
   audio();
-  if (S === 'title') { startRound(); return; }
+  if (S === 'title') { startRun(); return; }
+  if (S === 'banner') { if (banner.t > 0.5) beginLevel(); return; }
   if (S === 'results') {
     if (pt && inShare(pt)) { doShare(); return; }
-    if (resLock <= 0) startRound();
+    if (resLock <= 0) startRun();
     return;
   }
   tap(e.timeStamp);
@@ -605,15 +838,18 @@ addEventListener('keydown', e => {
 document.addEventListener('contextmenu', e => e.preventDefault());
 
 // Title screen shows a clamped bar as a backdrop.
-newBar(0, false); bar.phase = 'wait'; bar.cx = bar.x = W / 2;
+newBar(0, 'bar'); bar.phase = 'wait'; bar.cx = bar.x = W / 2;
 
 // Small debug/test surface (harmless in production).
 window.__drop = {
-  cfg: CFG,
+  cfg: CFG, dbg,
   tap: () => tap(performance.now()),
-  start: startRound,
-  state: () => ({ S, idx, score, caught, missed, fakes, streak, maxStreak, accuracy: accuracyPct(), best, log: log.slice(),
-    bar: bar && { top: bar.top, h: bar.h, vy: bar.vy, g: bar.g, decoy: bar.decoy, phase: bar.phase, pt: bar.pt, tell: bar.tell, wait: bar.wait }, handY: CFG.handY }),
+  start: startRun,
+  skipBanner: () => { if (S === 'banner') beginLevel(); },
+  goto: lv => { startRun(); banner.lv = lv; beginLevel(); },
+  state: () => ({ S, level, idx, hp, dead, lost, score, caught, fakes, streak, maxStreak, accuracy: accuracyPct(), best, log: log.slice(),
+    bar: bar && { kind: bar.kind, top: bar.top, h: bar.h, vy: bar.vy, g: bar.g, off: bar.off, segs: bar.segs, phase: bar.phase, pt: bar.pt, tell: bar.tell, wait: bar.wait },
+    handY: CFG.handY }),
 };
 
 requestAnimationFrame(t => { lastFrame = t; requestAnimationFrame(frame); });
