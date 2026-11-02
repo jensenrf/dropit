@@ -145,7 +145,17 @@ let level = 1, hp = CFG.hpMax, lost = 0, dead = null, banner = null, hpHit = 0;
 let score = 0, shownScore = 0, caught = 0, fakes = 0, streak = 0, maxStreak = 0, accSum = 0;
 let tierCounts = [0, 0, 0, 0];
 let log = [];                 // this level: tier index, -1 miss, -2 spiked
-let best = loadNum('dropit_best'), bestLevel = loadNum('dropit_best_level'), newBest = false;
+let newBest = false;
+// "Best today": the best score from today's runs, together with the level reached in THAT run.
+// It starts fresh each day, at the same moment the leaderboard and the deck reset.
+function todayBest() {
+  const day = dayKey();
+  try {
+    const t = JSON.parse(localStorage.getItem('dropit_today') || 'null');
+    if (t && t.day === day && t.score > 0) return t;
+  } catch (e) {}
+  return { day, score: 0, level: 0 };
+}
 let particles = [], texts = [];
 let handGap = 66, handHold = 0, handClosedGap = 7;
 let shake = 0, flash = 0, flashColor = '#fff';
@@ -431,8 +441,11 @@ function tap(ts) {
 
 function finishRun() {
   S = 'results'; resLock = 0.6;
-  if (score > best) { best = score; newBest = true; saveNum('dropit_best', best); }
-  if (level > bestLevel) { bestLevel = level; saveNum('dropit_best_level', bestLevel); }
+  const tb = todayBest();
+  if (score > tb.score) {
+    newBest = true;
+    try { localStorage.setItem('dropit_today', JSON.stringify({ day: dayKey(), score, level })); } catch (e) {}
+  }
   tone(300, 0.2, 'triangle', 0.1); tone(240, 0.2, 'triangle', 0.1, 0.12); tone(180, 0.4, 'triangle', 0.1, 0.24);
   checkLeaderboard();
 }
@@ -897,7 +910,8 @@ function drawTitle() {
   lines.forEach((l, i) => text(l, W / 2, 350 + i * 26, 15, '#8d97d6', 'center', 500));
   const pulse = 0.65 + 0.35 * Math.sin(performance.now() / 350);
   text('TAP TO START', W / 2, 610, 26, '#ffe066', 'center', 800, pulse);
-  if (best) text(`BEST ${best}  -  LEVEL ${bestLevel}`, W / 2, 652, 15, '#8d97d6', 'center', 700);
+  const tb = todayBest();
+  if (tb.score) text(`BEST TODAY  ${tb.score}  -  LEVEL ${tb.level}`, W / 2, 652, 15, '#8d97d6', 'center', 700);
   button(titleBoardBtn, "TODAY'S TOP 10", 14);
 }
 
@@ -914,7 +928,8 @@ function drawResults() {
   text('GAME OVER', W / 2, 138, 14, '#8d97d6', 'center', 700);
   text(dead || '', W / 2, 166, 20, '#ff6b6b', 'center', 800);
   text(String(Math.round(shownScore)), W / 2, 232, 80, '#fff', 'center', 800);
-  text(newBest ? 'NEW BEST!' : 'BEST ' + best, W / 2, 288, 16, newBest ? '#ffe066' : '#8d97d6', 'center', 800);
+  const tb = todayBest();
+  text(newBest ? 'NEW BEST TODAY!' : 'BEST TODAY ' + tb.score + '  -  LEVEL ' + tb.level, W / 2, 288, 16, newBest ? '#ffe066' : '#8d97d6', 'center', 800);
   const cols = [['LEVEL', String(level)], ['CAUGHT', String(caught)], ['ACCURACY', accuracyPct() + '%'], ['STREAK', String(maxStreak)]];
   cols.forEach(([k, v], i) => {
     const x = 30 + (W - 60) * (i + 0.5) / 4;
@@ -1059,7 +1074,7 @@ window.__drop = {
   buildCards, buildPlan, dayKey,
   banner: lv => { startBanner(lv, true); },
   goto: lv => { startRun(); banner.lv = lv; beginLevel(); },
-  state: () => ({ S, level, idx, hp, dead, lost, score, caught, fakes, streak, maxStreak, accuracy: accuracyPct(), best, log: log.slice(),
+  state: () => ({ S, level, idx, hp, dead, lost, score, caught, fakes, streak, maxStreak, accuracy: accuracyPct(), best: todayBest(), log: log.slice(),
     bar: bar && { kind: bar.kind, top: bar.top, h: bar.h, vy: bar.vy, g: bar.g, off: bar.off, segs: bar.segs, phase: bar.phase, pt: bar.pt, tell: bar.tell, wait: bar.wait },
     handY: CFG.handY }),
 };
