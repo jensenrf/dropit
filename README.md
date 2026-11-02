@@ -8,9 +8,9 @@ A one-button reflex game. Bars ride in on a rail, a clamp rattles and lets go, a
 - Tap (or press Space) to catch the falling bar as close to the glowing target as you can. Consecutive catches build a combo multiplier.
 - Tapping before the clamp lets go is a miss ("TOO EARLY").
 - A run is a series of levels. Catch 6 of 10 bars to clear one. You get 1 clamp health back after each level (max 3).
-- The run ends if you fail a level, your clamp health hits 0, or you catch a bomb.
+- The run ends if you fail a level, your clamp health hits 0, or you catch a bomb. A single miss only resets your combo.
 - Fake-outs: sometimes the clamp lets go, the bar drops a little, then gets re-grabbed. Tap then and you lose points and your combo.
-- New twists as you climb: moving target (L2), ghost sections you slip through (L3), spikes that damage the clamp (L4), bombs (L5), then everything speeds up.
+- New twists as you climb: moving target (L2), spiked sections that cost 1 clamp health (L3), planted bombs that blow up the clamp and end the run (L4), then everything speeds up.
 - Your best score and level are saved in your browser.
 
 ## Tweaking
