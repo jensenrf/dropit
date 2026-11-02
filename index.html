@@ -878,7 +878,7 @@ function drawBanner() {
   const k = Math.min(1, banner.t / 0.25);
   text(banner.cleared ? 'LEVEL CLEAR' : 'GET READY', W / 2, 200, 16, banner.cleared ? '#5ef2c2' : '#8d97d6', 'center', 800);
   text('LEVEL ' + banner.lv, W / 2, 262, 60, '#fff', 'center', 800, k);
-  const info = LEVEL_INFO[Math.min(banner.lv, 6)];
+  const info = LEVEL_INFO[Math.min(banner.lv, 5)] || LEVEL_INFO[5];
   text(info[0], W / 2, 342, 22, '#ffe066', 'center', 800);
   text(info[1], W / 2, 374, 15, '#aab4ee', 'center', 500);
   text(`Catch ${CFG.passMin} of ${CFG.barsPerLevel} to advance`, W / 2, 430, 15, '#8d97d6', 'center', 500);
@@ -1003,11 +1003,11 @@ function draw() {
    LOOP + INPUT
    ============================================================ */
 function frame(now) {
+  requestAnimationFrame(frame);                 // schedule first: an error below can't stop the loop
   const dt = Math.min(0.05, (now - lastFrame) / 1000);
   lastFrame = now;
-  update(dt);
-  draw();
-  requestAnimationFrame(frame);
+  try { update(dt); draw(); }
+  catch (e) { if (!frame.warned) { frame.warned = true; console.error('drop_it frame error', e); } }
 }
 
 function toLogical(e) {
@@ -1057,6 +1057,7 @@ window.__drop = {
   endRun: (sc, why) => { score = shownScore = sc; caught = 3; dead = why || 'LEVEL FAILED'; finishRun(); },
   lb: () => ({ S, board, entry, lbNote, highlight, boardFrom }),
   buildCards, buildPlan, dayKey,
+  banner: lv => { startBanner(lv, true); },
   goto: lv => { startRun(); banner.lv = lv; beginLevel(); },
   state: () => ({ S, level, idx, hp, dead, lost, score, caught, fakes, streak, maxStreak, accuracy: accuracyPct(), best, log: log.slice(),
     bar: bar && { kind: bar.kind, top: bar.top, h: bar.h, vy: bar.vy, g: bar.g, off: bar.off, segs: bar.segs, phase: bar.phase, pt: bar.pt, tell: bar.tell, wait: bar.wait },
