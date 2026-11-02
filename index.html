@@ -447,7 +447,15 @@ function finishRun() {
     try { localStorage.setItem('dropit_today', JSON.stringify({ day: dayKey(), score, level })); } catch (e) {}
   }
   tone(300, 0.2, 'triangle', 0.1); tone(240, 0.2, 'triangle', 0.1, 0.12); tone(180, 0.4, 'triangle', 0.1, 0.24);
+  logRun();
   checkLeaderboard();
+}
+
+/* ---------- play report: one anonymous record per finished run (level, score, what ended it) ---------- */
+function logRun() {
+  const why = dead || '';
+  const cause = /BOMB/.test(why) ? 'bomb' : /CLAMP/.test(why) ? 'clamp' : 'failed';
+  lbCall('log_run', { p_level: level, p_score: Math.max(0, Math.round(score)), p_cause: cause }).catch(() => {});
 }
 
 /* ---------- leaderboard logic ---------- */
