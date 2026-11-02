@@ -13,6 +13,9 @@ A one-button reflex game. Bars ride in on a rail, a clamp rattles and lets go, a
 - New twists as you climb: moving target (L2), spiked sections that cost 1 clamp health (L3), planted bombs that blow up the clamp and end the run (L4), then everything speeds up.
 - Your best score and level are saved in your browser.
 
+## The daily deck
+Each level is a "deck" of 10 bars (target position, hazards, timing). The deck's contents are seeded by the date, so **every player gets the same bars that day** and the leaderboard is fair. The order is **shuffled fresh on every run**, so nothing can be memorized or predicted. A new deck appears at midnight Arizona time.
+
 ## Daily leaderboard
 - Finish a run in today's top 10 and you enter 3 letters/numbers, arcade style (tap the arrows or just type).
 - "Today's Top 10" is on the title screen and the game-over screen. The board resets each day at midnight Arizona time (old scores are kept in the database).
