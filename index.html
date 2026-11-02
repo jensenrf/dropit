@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>drop_it</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b1020;overflow:hidden;touch-action:none;
+    -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;overscroll-behavior:none}
+  canvas{display:block;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+    -webkit-tap-highlight-color:transparent}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+'use strict';
+
+/* ============================================================
+   TUNABLES  (everything you'd want to tweak while playtesting)
+   ============================================================ */
+const CFG = {
+  bars: 20,                 // real bars per round (decoys don't count)
+  handY: 500,               // y of the catch line
+  groundY: 700,             // y of the platform
+  railY: 106,               // y of the conveyor rail
+  hangGap: 140,             // how far above the hand the bar's bottom hangs
+  barW: 34,
+  hMax: 200, hMin: 130,     // bar height: first bar -> last bar
+  gMin: 800, gMax: 1300,    // gravity (px/s^2): first bar -> last bar
+  enterTime: 0.55,          // carriage scroll-in time
+  exitTime: 0.5,            // carriage scroll-out time
+  waitStart: [0.6, 1.5],    // random hold before the shake starts (s), bar 1
+  waitEnd:   [0.2, 0.6],    // ... by the last bar
+  tellStart: [0.45, 0.85],  // random shake length before release (s), bar 1
+  tellEnd:   [0.20, 0.40],  // ... by the last bar
+  decoyFrom: 3,             // no fake-outs until this many real bars are done
+  decoyChance: [0.15, 0.30],// chance a fake-out precedes a bar (never two in a row)
+  fakePenalty: 25,          // points lost for tapping a fake-out (also resets combo)
+  comboStep: 0.5,           // each consecutive catch adds this to the multiplier
+  tiers: [                  // f = distance from center, 0 (center) .. 1 (edge)
+    { name: 'PERFECT', f: 0.20, mult: 10, color: '#ffe066' },
+    { name: 'GREAT',   f: 0.45, mult: 5,  color: '#5ef2c2' },
+    { name: 'GOOD',    f: 0.75, mult: 2,  color: '#6cb8ff' },
+    { name: 'EDGE',    f: 1.01, mult: 1,  color: '#c3c9dd' },
+  ],
+};
+
+/* ============================================================
+   SETUP
+   ============================================================ */
+const W = 420, H = 760;
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let scale = 1, dpr = 1;
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 3);
+  scale = Math.min(innerWidth / W, innerHeight / H);
+  cv.style.width = W * scale + 'px';
+  cv.style.height = H * scale + 'px';
+  cv.width = Math.round(W * scale * dpr);
+  cv.height = Math.round(H * scale * dpr);
+}
+addEventListener('resize', resize); resize();
+
+const lerp = (a, b, t) => a + (b - a) * t;
+const rand = (a, b) => a + Math.random() * (b - a);
+const ease = t => 1 - Math.pow(1 - t, 3);
+const easeIn = t => t * t * t;
+function loadBest() { try { return +localStorage.getItem('dropit_best') || 0; } catch (e) { return 0; } }
+function saveBest(v) { try { localStorage.setItem('dropit_best', String(v)); } catch (e) {} }
+
+function rr(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+/* ---------- audio (tiny synth, no assets) ---------- */
+let AC = null;
+function audio() {
+  try {
+    if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+    if (AC.state === 'suspended') AC.resume();
+  } catch (e) { AC = null; }
+  return AC;
+}
+function tone(f, d = 0.12, type = 'sine', vol = 0.12, delay = 0) {
+  if (!AC) return;
+  const t = AC.currentTime + delay;
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.setValueAtTime(f, t);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+  o.connect(g); g.connect(AC.destination);
+  o.start(t); o.stop(t + d + 0.03);
+}
+function buzz(ms) { try { navigator.vibrate && navigator.vibrate(ms); } catch (e) {} }
+
+/* ============================================================
+   GAME STATE
+   ============================================================ */
+// S: 'title' | 'hang' | 'fall' | 'settle' | 'results'
+// While S === 'hang' the bar has a phase: enter | wait | shake | hitch | hold | exit
+let S = 'title';
+let bar = null, idx = 0, timer = 0, lastWasDecoy = false;
+let score = 0, shownScore = 0, caught = 0, missed = 0, fakes = 0, streak = 0, maxStreak = 0, accSum = 0;
+let tierCounts = [0, 0, 0, 0];
+let log = [];                 // per-bar result: tier index, or -1 for miss
+let best = loadBest(), newBest = false;
+let particles = [], texts = [];
+let handGap = 66, handHold = 0, handClosedGap = 7;
+let shake = 0, flash = 0, flashColor = '#fff';
+let resLock = 0, lastFrame = performance.now();
+let toast = null;
+const shareBtn = { x: 70, y: 530, w: 280, h: 50 };
+
+function newBar(i, decoy) {
+  const t = CFG.bars > 1 ? Math.min(1, i / (CFG.bars - 1)) : 0;
+  const h = lerp(CFG.hMax, CFG.hMin, t);
+  const w0 = lerp(CFG.waitStart[0], CFG.waitEnd[0], t), w1 = lerp(CFG.waitStart[1], CFG.waitEnd[1], t);
+  const k0 = lerp(CFG.tellStart[0], CFG.tellEnd[0], t), k1 = lerp(CFG.tellStart[1], CFG.tellEnd[1], t);
+  const top0 = CFG.handY - CFG.hangGap - h;
+  bar = {
+    i, h, g: lerp(CFG.gMin, CFG.gMax, t), decoy,
+    top: top0, top0, vy: 0, cx: -60, x: -60, ox: 0, oy: 0, dip: 0, jaw: CFG.barW / 2,
+    phase: 'enter', pt: 0, wait: rand(w0, w1) * (decoy ? 0.8 : 1), tell: rand(k0, k1), rattle: 0,
+    released: false, exitT: 0, penalized: false,
+    free: false, caught: false, landed: false, tier: -1, f: 1,
+  };
+  timer = 0;
+}
+
+function spawn() {
+  const t = CFG.bars > 1 ? idx / (CFG.bars - 1) : 0;
+  const decoy = !lastWasDecoy && idx >= CFG.decoyFrom && Math.random() < lerp(CFG.decoyChance[0], CFG.decoyChance[1], t);
+  lastWasDecoy = decoy;
+  newBar(idx, decoy);
+  S = 'hang';
+}
+
+function startRound() {
+  score = shownScore = caught = missed = fakes = streak = maxStreak = 0;
+  accSum = 0; tierCounts = [0, 0, 0, 0]; log = []; newBest = false;
+  particles = []; texts = []; idx = 0; handHold = 0; lastWasDecoy = false;
+  spawn();
+}
+
+/* ============================================================
+   RULES
+   ============================================================ */
+function addText(x, y, text, color, size = 26, life = 0.9) {
+  texts.push({ x, y, text, color, size, life, max: life });
+}
+function burst(x, y, color, n, speed) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, Math.PI * 2), s = rand(speed * 0.4, speed);
+    particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - speed * 0.3, life: rand(0.35, 0.7), max: 0.7, color, r: rand(2, 4.5) });
+  }
+}
+
+function endBarMiss(label) {
+  S = 'settle'; timer = 0;
+  streak = 0; missed++; log.push(-1);
+  addText(W / 2, CFG.handY - 70, label, '#ff6b6b', 30, 1.0);
+  shake = Math.max(shake, 7);
+  tone(150, 0.25, 'sawtooth', 0.09); buzz(60);
+}
+
+function releaseBar() {
+  // Real drop: clamp opens, bar falls.
+  bar.released = true; bar.free = true; bar.jaw = CFG.barW / 2 + 16;
+  bar.x = W / 2; bar.ox = 0; bar.oy = 0; bar.phase = 'fall';
+  S = 'fall';
+  tone(95, 0.12, 'square', 0.1); tone(60, 0.16, 'sawtooth', 0.07, 0.02);
+}
+
+function falseStart() {
+  // Tapped before the bar was released / in reach.
+  if (!bar.released) { bar.released = true; bar.free = true; bar.jaw = CFG.barW / 2 + 16; bar.x = W / 2; bar.ox = 0; bar.oy = 0; }
+  handHold = 0.18; handClosedGap = 6;
+  endBarMiss('TOO EARLY');
+}
+
+function fakePenalty() {
+  // Tapped a fake-out: combo gone, points docked, bar carries on and leaves.
+  bar.penalized = true; fakes++; streak = 0;
+  const lost = Math.min(score, CFG.fakePenalty); score -= lost;
+  handHold = 0.18; handClosedGap = 6;
+  addText(W / 2, CFG.handY - 70, 'FAKE-OUT!', '#ff9f43', 30, 1.0);
+  if (lost) addText(W / 2, CFG.handY - 38, '-' + lost, '#ff6b6b', 24, 1.0);
+  shake = Math.max(shake, 6);
+  tone(200, 0.2, 'sawtooth', 0.09); tone(140, 0.2, 'square', 0.07, 0.08); buzz(60);
+}
+
+function doCatch(top) {
+  bar.top = top; bar.vy = 0; bar.caught = true; bar.free = false;
+  const cy = top + bar.h / 2;
+  const f = Math.min(1, Math.abs(cy - CFG.handY) / (bar.h / 2));
+  let ti = CFG.tiers.findIndex(t => f <= t.f); if (ti < 0) ti = CFG.tiers.length - 1;
+  const tier = CFG.tiers[ti];
+  streak++; maxStreak = Math.max(maxStreak, streak);
+  const mult = 1 + CFG.comboStep * (streak - 1);
+  const pts = Math.round(tier.mult * mult);
+  score += pts; caught++; accSum += (1 - f); tierCounts[ti]++; log.push(ti);
+  bar.tier = ti; bar.f = f;
+  S = 'settle'; timer = 0;
+  handHold = 0.5; handClosedGap = CFG.barW / 2 + 1;
+  addText(W / 2, CFG.handY - 70, tier.name, tier.color, ti === 0 ? 34 : 28, 0.9);
+  addText(W / 2, CFG.handY - 38, '+' + pts, '#fff', 24, 0.9);
+  burst(W / 2, CFG.handY, tier.color, [34, 18, 9, 4][ti], [420, 320, 240, 160][ti]);
+  if (ti === 0) { flash = 0.28; flashColor = tier.color; shake = Math.max(shake, 6); }
+  const base = 520 + Math.min(streak, 12) * 28;
+  if (ti === 0) { tone(base, 0.14, 'triangle', 0.14); tone(base * 1.5, 0.2, 'triangle', 0.12, 0.07); }
+  else if (ti === 1) { tone(base, 0.14, 'triangle', 0.12); tone(base * 1.25, 0.14, 'triangle', 0.1, 0.06); }
+  else tone(base * (ti === 2 ? 0.9 : 0.7), 0.12, 'triangle', 0.1);
+  buzz(ti === 0 ? 25 : 12);
+}
+
+function tap(ts) {
+  if (S === 'hang') {
+    if (bar.decoy) {
+      if (bar.phase !== 'exit' && !bar.penalized) fakePenalty();
+      return;
+    }
+    falseStart(); return;
+  }
+  if (S !== 'fall') return;
+  // Advance the bar to the exact moment of the input, not the last frame.
+  const extra = Math.max(0, Math.min(0.034, ((ts || performance.now()) - lastFrame) / 1000));
+  const top = bar.top + bar.vy * extra + 0.5 * bar.g * extra * extra;
+  const bottom = top + bar.h;
+  if (bottom < CFG.handY) { falseStart(); return; }   // not in reach yet
+  if (top > CFG.handY) return;                        // already slipped past
+  doCatch(top);
+}
+
+function finishRound() {
+  S = 'results'; resLock = 0.55;
+  if (score > best) { best = score; newBest = true; saveBest(best); }
+  tone(392, 0.15, 'triangle', 0.1); tone(523, 0.15, 'triangle', 0.1, 0.1); tone(659, 0.3, 'triangle', 0.1, 0.2);
+}
+
+function accuracyPct() { return caught ? Math.round(accSum / caught * 100) : 0; }
+
+function shareText() {
+  return `drop_it  |  ${score} pts  |  ${caught}/${CFG.bars} caught  |  ${accuracyPct()}% accuracy`;
+}
+function doShare() {
+  const text = shareText();
+  const done = ok => { toast = { msg: ok ? 'Copied to clipboard!' : 'Could not copy', life: 1.6 }; };
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => done(true), () => fallbackCopy(text, done));
+      return;
+    }
+  } catch (e) {}
+  fallbackCopy(text, done);
+}
+function fallbackCopy(text, done) {
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta); done(ok);
+  } catch (e) { done(false); }
+}
+
+/* ============================================================
+   UPDATE
+   ============================================================ */
+function physics(dt) {
+  bar.vy += bar.g * dt;
+  bar.top += bar.vy * dt;
+  if (bar.top + bar.h >= CFG.groundY) {
+    bar.top = CFG.groundY - bar.h; bar.vy = 0; bar.landed = true;
+    if (S === 'fall') endBarMiss('MISS');
+    else shake = Math.max(shake, 3);
+  }
+}
+
+function updateHang(dt) {
+  const b = bar;
+  b.pt += dt;
+  b.ox = 0; b.oy = 0; b.dip = 0;
+  switch (b.phase) {
+    case 'enter': {
+      const k = Math.min(1, b.pt / CFG.enterTime);
+      b.cx = lerp(-60, W / 2, ease(k));
+      if (k >= 1) { b.cx = W / 2; b.phase = 'wait'; b.pt = 0; tone(120, 0.08, 'square', 0.06); }
+      break;
+    }
+    case 'wait':
+      if (b.pt >= b.wait) { b.phase = 'shake'; b.pt = 0; b.rattle = 0; }
+      break;
+    case 'shake': {
+      // The tell: the clamp rattles harder and harder until it lets go.
+      const k = Math.min(1, b.pt / b.tell), amp = lerp(0.6, 3.4, k);
+      b.ox = rand(-amp, amp); b.oy = rand(-amp, amp) * 0.6;
+      b.rattle -= dt;
+      if (b.rattle <= 0) { tone(150 + rand(0, 70), 0.03, 'square', 0.03); b.rattle = 0.06; }
+      if (b.pt >= b.tell) {
+        if (b.decoy) {
+          b.phase = 'hitch'; b.pt = 0;
+          burst(b.cx, b.top0 + 6, '#ffd166', 10, 220);
+          tone(300, 0.05, 'square', 0.08); tone(90, 0.1, 'sawtooth', 0.07, 0.03);
+          buzz(20);
+        } else { releaseBar(); }
+      }
+      break;
+    }
+    case 'hitch': {
+      // Clamp springs, bar dips, snaps back. It never actually lets go.
+      const p = b.pt;
+      b.dip = p < 0.07 ? (p / 0.07) * 11 : p < 0.2 ? 11 * (1 - (p - 0.07) / 0.13) : 0;
+      b.jaw = CFG.barW / 2 + (p < 0.1 ? 5 : 0);
+      if (b.pt >= 0.3) { b.phase = 'hold'; b.pt = 0; b.jaw = CFG.barW / 2; }
+      break;
+    }
+    case 'hold':
+      if (b.pt >= 0.45) { b.phase = 'exit'; b.pt = 0; }
+      break;
+    case 'exit': {
+      const k = Math.min(1, b.pt / CFG.exitTime);
+      b.cx = W / 2 + easeIn(k) * (W / 2 + 90);
+      if (k >= 1) spawn();
+      break;
+    }
+  }
+  if (bar && !bar.released) bar.x = bar.cx;
+}
+
+function update(dt) {
+  // hand pads
+  const target = handHold > 0 ? handClosedGap : 66;
+  handHold = Math.max(0, handHold - dt);
+  handGap += (target - handGap) * Math.min(1, dt * 28);
+
+  if (S === 'hang') updateHang(dt);
+
+  if (S === 'fall' && !bar.landed) {
+    // sub-step so landing/catch timing is consistent across frame rates
+    let left = dt;
+    while (left > 0 && S === 'fall') { const s = Math.min(left, 1 / 240); physics(s); left -= s; }
+  } else if (S === 'settle') {
+    timer += dt;
+    if (bar.free && !bar.landed) physics(dt);
+    if (timer >= 0.8 && (bar.landed || bar.caught)) {
+      idx++;
+      if (idx >= CFG.bars) finishRound(); else spawn();
+    }
+  } else if (S === 'results') {
+    resLock = Math.max(0, resLock - dt);
+  }
+
+  // the empty carriage glides away after a release
+  if (bar && bar.released) {
+    bar.exitT += dt;
+    bar.cx = W / 2 + easeIn(Math.min(1, bar.exitT / 0.6)) * (W / 2 + 90);
+  }
+
+  // score count-up
+  shownScore += (score - shownScore) * Math.min(1, dt * 14);
+  if (Math.abs(score - shownScore) < 0.5) shownScore = score;
+
+  // fx
+  for (const p of particles) { p.life -= dt; p.vy += 900 * dt; p.x += p.vx * dt; p.y += p.vy * dt; }
+  particles = particles.filter(p => p.life > 0);
+  for (const t of texts) { t.life -= dt; t.y -= 26 * dt; }
+  texts = texts.filter(t => t.life > 0);
+  shake = Math.max(0, shake - dt * 30);
+  flash = Math.max(0, flash - dt * 1.4);
+  if (toast) { toast.life -= dt; if (toast.life <= 0) toast = null; }
+}
+
+/* ============================================================
+   DRAW
+   ============================================================ */
+const FONT = 'system-ui,-apple-system,"Segoe UI",Roboto,sans-serif';
+function text(str, x, y, size, color, align = 'center', weight = 700, alpha = 1) {
+  ctx.globalAlpha = alpha;
+  ctx.font = `${weight} ${size}px ${FONT}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle';
+  ctx.fillStyle = color; ctx.fillText(str, x, y);
+  ctx.globalAlpha = 1;
+}
+
+function drawRail() {
+  const y = CFG.railY;
+  const g = ctx.createLinearGradient(0, y - 8, 0, y + 8);
+  g.addColorStop(0, '#59638f'); g.addColorStop(0.5, '#3a426b'); g.addColorStop(1, '#232a4d');
+  ctx.fillStyle = g; ctx.fillRect(-20, y - 8, W + 40, 16);
+  ctx.fillStyle = 'rgba(255,255,255,.18)'; ctx.fillRect(-20, y - 8, W + 40, 2);
+  ctx.fillStyle = 'rgba(0,0,0,.35)';
+  for (let x = 14; x < W; x += 42) { ctx.beginPath(); ctx.arc(x, y, 2.2, 0, 7); ctx.fill(); }
+}
+
+// Carriage + arm + crossbar (drawn behind the bar). Jaws are drawn over the bar.
+function drawClamp(b, front) {
+  const jitterX = b.released ? 0 : b.ox, jitterY = b.released ? 0 : b.oy;
+  const cx = b.cx + jitterX, crossY = b.top0 - 10 + jitterY;
+  if (!front) {
+    // carriage on the rail
+    ctx.fillStyle = '#1a2040';
+    ctx.beginPath(); ctx.arc(cx - 15, CFG.railY, 7, 0, 7); ctx.arc(cx + 15, CFG.railY, 7, 0, 7); ctx.fill();
+    ctx.fillStyle = '#6a77c0';
+    ctx.beginPath(); ctx.arc(cx - 15, CFG.railY, 3, 0, 7); ctx.arc(cx + 15, CFG.railY, 3, 0, 7); ctx.fill();
+    const cg = ctx.createLinearGradient(0, CFG.railY + 4, 0, CFG.railY + 30);
+    cg.addColorStop(0, '#6370b8'); cg.addColorStop(1, '#343c75');
+    ctx.fillStyle = cg; rr(cx - 26, CFG.railY + 4, 52, 28, 7); ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth = 1.5; rr(cx - 26, CFG.railY + 4, 52, 28, 7); ctx.stroke();
+    // hydraulic arm
+    ctx.fillStyle = '#8590d8'; ctx.fillRect(cx - 4, CFG.railY + 30, 8, Math.max(0, crossY - (CFG.railY + 30)));
+    ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.fillRect(cx + 1, CFG.railY + 30, 3, Math.max(0, crossY - (CFG.railY + 30)));
+    // crossbar
+    ctx.fillStyle = '#9aa6f0'; rr(cx - 30, crossY - 4, 60, 10, 4); ctx.fill();
+  } else {
+    // jaws gripping the bar top
+    const jy = b.top0 - 4 + jitterY;
+    ctx.fillStyle = '#c3cbff';
+    rr(cx - b.jaw - 9, jy, 9, 28, 3); ctx.fill();
+    rr(cx + b.jaw, jy, 9, 28, 3); ctx.fill();
+    ctx.fillStyle = 'rgba(0,0,0,.25)';
+    rr(cx - b.jaw - 9, jy + 20, 9, 8, 3); ctx.fill();
+    rr(cx + b.jaw, jy + 20, 9, 8, 3); ctx.fill();
+  }
+}
+
+function drawBar(b) {
+  const w = CFG.barW, h = b.h;
+  const x = b.x + (b.released ? 0 : b.ox) - w / 2;
+  const y = b.top + (b.released ? 0 : b.oy) + b.dip;
+  ctx.save();
+  rr(x, y, w, h, 8); ctx.clip();
+  const g = ctx.createLinearGradient(x, 0, x + w, 0);
+  g.addColorStop(0, '#f0a030'); g.addColorStop(0.5, '#ffe08a'); g.addColorStop(1, '#e08a20');
+  ctx.fillStyle = g; ctx.fillRect(x, y, w, h);
+  const cy = y + h / 2, half = h / 2;
+  // scoring zones, wide to narrow
+  const zones = [[0.75, 'rgba(110,184,255,.35)'], [0.45, 'rgba(94,242,194,.55)'], [0.20, 'rgba(255,255,255,.9)']];
+  for (const [f, col] of zones) { ctx.fillStyle = col; ctx.fillRect(x, cy - half * f, w, half * f * 2); }
+  // ruler ticks
+  ctx.strokeStyle = 'rgba(60,35,0,.45)'; ctx.lineWidth = 1.5;
+  for (let k = 1; k < 10; k++) {
+    const ty = y + (h * k) / 10, len = k === 5 ? 0 : (k % 5 === 0 ? 10 : 6);
+    ctx.beginPath(); ctx.moveTo(x, ty); ctx.lineTo(x + len, ty); ctx.moveTo(x + w, ty); ctx.lineTo(x + w - len, ty); ctx.stroke();
+  }
+  // center line
+  ctx.strokeStyle = '#2a1b00'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, cy); ctx.lineTo(x + w, cy); ctx.stroke();
+  ctx.restore();
+  ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth = 2; rr(x, y, w, h, 8); ctx.stroke();
+}
+
+function drawHand() {
+  const y = CFG.handY, cx = W / 2;
+  const lit = handHold > 0 && bar && bar.caught ? CFG.tiers[bar.tier].color : '#9fb0ff';
+  ctx.fillStyle = '#242c57';
+  rr(-20, y - 13, cx - handGap + 20 - 24, 26, 13); ctx.fill();
+  rr(cx + handGap + 24, y - 13, W - (cx + handGap + 24) + 20, 26, 13); ctx.fill();
+  ctx.fillStyle = lit;
+  rr(cx - handGap - 28, y - 16, 28, 32, 10); ctx.fill();
+  rr(cx + handGap, y - 16, 28, 32, 10); ctx.fill();
+  // faint catch line
+  ctx.strokeStyle = 'rgba(159,176,255,.16)'; ctx.setLineDash([6, 8]); ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(cx - handGap - 30, y); ctx.moveTo(cx + handGap + 30, y); ctx.lineTo(W, y); ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function drawScene() {
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#0b1020'); bg.addColorStop(1, '#1b2150');
+  ctx.fillStyle = bg; ctx.fillRect(-20, -20, W + 40, H + 40);
+  // platform
+  const pg = ctx.createLinearGradient(0, CFG.groundY, 0, H);
+  pg.addColorStop(0, '#39427a'); pg.addColorStop(1, '#171c40');
+  ctx.fillStyle = pg; ctx.fillRect(-20, CFG.groundY, W + 40, H - CFG.groundY + 20);
+  ctx.fillStyle = '#7f8cff'; ctx.fillRect(-20, CFG.groundY, W + 40, 3);
+  drawRail();
+  drawHand();
+  if (bar) { drawClamp(bar, false); drawBar(bar); drawClamp(bar, true); }
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life / p.max); ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  for (const t of texts) text(t.text, t.x, t.y, t.size, t.color, 'center', 800, Math.min(1, (t.life / t.max) * 1.6));
+}
+
+function drawHUD() {
+  // progress pips
+  const n = CFG.bars, gap = (W - 48) / n;
+  for (let i = 0; i < n; i++) {
+    const x = 24 + gap * (i + 0.5);
+    let col = 'rgba(255,255,255,.18)';
+    if (i < log.length) col = log[i] < 0 ? '#ff6b6b' : CFG.tiers[log[i]].color;
+    else if (i === idx && S !== 'results' && !(bar && bar.decoy)) col = '#fff';
+    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, 20, 5, 0, 7); ctx.fill();
+  }
+  text(String(Math.round(shownScore)), 24, 60, 40, '#fff', 'left', 800);
+  if (streak >= 2) {
+    const mult = 1 + CFG.comboStep * (streak - 1);
+    text('x' + mult.toFixed(1), W - 24, 56, 28, '#ffe066', 'right', 800);
+    text('COMBO', W - 24, 78, 11, '#8d97d6', 'right', 700);
+  }
+}
+
+function overlayDim(a) { ctx.fillStyle = `rgba(6,9,22,${a})`; ctx.fillRect(-20, -20, W + 40, H + 40); }
+
+function drawTitle() {
+  overlayDim(0.72);
+  text('drop_it', W / 2, 250, 64, '#fff', 'center', 800);
+  text('catch the bar. aim for the middle.', W / 2, 298, 16, '#aab4ee', 'center', 500);
+  const lines = ['Wait for the clamp to let go, then tap.', 'Tap too early and it counts as a miss.', 'Beware fake-outs: the clamp can jam.'];
+  lines.forEach((l, i) => text(l, W / 2, 350 + i * 26, 15, '#8d97d6', 'center', 500));
+  const pulse = 0.65 + 0.35 * Math.sin(performance.now() / 350);
+  text('TAP TO START', W / 2, 610, 26, '#ffe066', 'center', 800, pulse);
+  if (best) text('BEST ' + best, W / 2, 656, 15, '#8d97d6', 'center', 700);
+}
+
+function drawResults() {
+  overlayDim(0.72);
+  ctx.fillStyle = '#141a3d'; rr(30, 100, W - 60, 540, 22); ctx.fill();
+  ctx.strokeStyle = 'rgba(159,176,255,.25)'; ctx.lineWidth = 2; rr(30, 100, W - 60, 540, 22); ctx.stroke();
+  text('ROUND COMPLETE', W / 2, 142, 14, '#8d97d6', 'center', 700);
+  text(String(Math.round(shownScore)), W / 2, 215, 84, '#fff', 'center', 800);
+  text(newBest ? 'NEW BEST!' : 'BEST ' + best, W / 2, 275, 16, newBest ? '#ffe066' : '#8d97d6', 'center', 800);
+  const cols = [
+    ['CAUGHT', `${caught}/${CFG.bars}`], ['ACCURACY', accuracyPct() + '%'], ['STREAK', String(maxStreak)], ['FAKED OUT', String(fakes)],
+  ];
+  cols.forEach(([k, v], i) => {
+    const x = 30 + (W - 60) * (i + 0.5) / 4;
+    text(v, x, 340, 28, i === 3 && fakes ? '#ff9f43' : '#fff', 'center', 800);
+    text(k, x, 370, 10, '#8d97d6', 'center', 700);
+  });
+  // tier breakdown
+  CFG.tiers.forEach((t, i) => {
+    const x = 30 + (W - 60) * (i + 0.5) / 4;
+    ctx.fillStyle = t.color; ctx.beginPath(); ctx.arc(x, 425, 6, 0, 7); ctx.fill();
+    text(String(tierCounts[i]), x, 452, 22, '#fff', 'center', 800);
+    text(t.name, x, 477, 10, '#8d97d6', 'center', 700);
+  });
+  // share button
+  const b = shareBtn;
+  ctx.fillStyle = '#2a3270'; rr(b.x, b.y, b.w, b.h, 14); ctx.fill();
+  ctx.strokeStyle = '#7f8cff'; ctx.lineWidth = 2; rr(b.x, b.y, b.w, b.h, 14); ctx.stroke();
+  text('COPY RESULT TO SHARE', W / 2, b.y + b.h / 2, 15, '#fff', 'center', 800);
+  const pulse = resLock > 0 ? 0.25 : 0.65 + 0.35 * Math.sin(performance.now() / 350);
+  text('TAP ANYWHERE TO PLAY AGAIN', W / 2, 605, 16, '#ffe066', 'center', 800, pulse);
+}
+
+function draw() {
+  ctx.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
+  ctx.save();
+  if (shake > 0) ctx.translate(rand(-shake, shake), rand(-shake, shake));
+  drawScene();
+  ctx.restore();
+  if (flash > 0) { ctx.globalAlpha = flash; ctx.fillStyle = flashColor; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
+  if (S === 'title') drawTitle();
+  else { drawHUD(); if (S === 'results') drawResults(); }
+  if (toast) text(toast.msg, W / 2, 692, 15, '#5ef2c2', 'center', 800, Math.min(1, toast.life * 2));
+}
+
+/* ============================================================
+   LOOP + INPUT
+   ============================================================ */
+function frame(now) {
+  const dt = Math.min(0.05, (now - lastFrame) / 1000);
+  lastFrame = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+
+function toLogical(e) {
+  const r = cv.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / scale, y: (e.clientY - r.top) / scale };
+}
+function inShare(p) { const b = shareBtn; return p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h; }
+
+function press(e, pt) {
+  audio();
+  if (S === 'title') { startRound(); return; }
+  if (S === 'results') {
+    if (pt && inShare(pt)) { doShare(); return; }
+    if (resLock <= 0) startRound();
+    return;
+  }
+  tap(e.timeStamp);
+}
+
+cv.addEventListener('pointerdown', e => { e.preventDefault(); press(e, toLogical(e)); });
+addEventListener('keydown', e => {
+  if (e.repeat) return;
+  if (e.code === 'Space' || e.code === 'Enter' || e.code === 'ArrowDown') { e.preventDefault(); press(e, null); }
+});
+document.addEventListener('contextmenu', e => e.preventDefault());
+
+// Title screen shows a clamped bar as a backdrop.
+newBar(0, false); bar.phase = 'wait'; bar.cx = bar.x = W / 2;
+
+// Small debug/test surface (harmless in production).
+window.__drop = {
+  cfg: CFG,
+  tap: () => tap(performance.now()),
+  start: startRound,
+  state: () => ({ S, idx, score, caught, missed, fakes, streak, maxStreak, accuracy: accuracyPct(), best, log: log.slice(),
+    bar: bar && { top: bar.top, h: bar.h, vy: bar.vy, g: bar.g, decoy: bar.decoy, phase: bar.phase, pt: bar.pt, tell: bar.tell, wait: bar.wait }, handY: CFG.handY }),
+};
+
+requestAnimationFrame(t => { lastFrame = t; requestAnimationFrame(frame); });
+})();
+</script>
+</body>
+</html>
